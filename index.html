@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><script src="coi-serviceworker.min.js"></script><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}[hidden]{display:none!important}</style></head><body>
+<title>Giza Pyramid Detector v2 test</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: one-screen viewfinder — status strip, stage (camera/photo + overlay), control dock. Single dark "camera" look by choice. */
+:root {
+  --bg: #12100d;          /* night desert */
+  --panel: #1d1a15;
+  --line: #3a342a;
+  --fg: #f2ebdf;
+  --muted: #a99f8d;
+  --accent: #e8b04b;      /* limestone gold */
+  --ok: #57d68d; --warn: #f0a24a; --bad: #ff6b5e;
+  --k-apex: #ff4d4d; --k-l: #39d353; --k-r: #4c8dff; --k-n: #ffd23f; --k-f: #2fe0e0;
+  --display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.45 var(--display); display: flex; flex-direction: column; }
+.wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+header { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; padding-block: 10px 6px; }
+header .status { grid-column: 1 / -1; grid-row: 2; }
+@media (max-width: 560px) { h1 small { display: none; } }
+h1 { margin: 0; font-size: 18px; letter-spacing: .01em; text-wrap: balance; }
+h1 small { color: var(--muted); font-weight: 500; font-size: 12px; margin-left: 6px; }
+.status { font: 500 12px var(--mono); color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); margin-right: 6px; vertical-align: 1px; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+main { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding-block: 4px 12px; }
+.stage { position: relative; flex: 1; min-height: 360px; background: #000; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; display: grid; place-items: center; }
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+.stage .msg { position: absolute; inset: auto 12px 12px 12px; font: 12px var(--mono); color: var(--fg); background: rgba(18,16,13,.82); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.pose { position: absolute; top: 44px; left: 10px; right: 10px; font: 500 12px var(--mono); background: rgba(18,16,13,.8); padding: 6px 8px; border-radius: 6px; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+.readout { position: absolute; top: 10px; left: 10px; font: 500 12px var(--mono); background: rgba(18,16,13,.78); padding: 6px 8px; border-radius: 6px; font-variant-numeric: tabular-nums; }
+.modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.modes .mode { background: transparent; color: var(--muted); border-radius: 0; padding: 10px 6px; font-size: 13px; border-left: 1px solid var(--line); }
+.modes .mode:first-child { border-left: 0; }
+.modes .mode[aria-pressed="true"] { background: var(--panel); color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+button.tiny { padding: 6px 12px; font-size: 13px; }
+.more { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.dock { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+button, .btn { font: 600 14px var(--display); color: var(--bg); background: var(--accent); border: 0; border-radius: 9px; padding: 12px 14px; cursor: pointer; text-align: center; }
+button.ghost, .btn.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+button:focus-visible, .btn:focus-within, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .45; cursor: default; }
+.btn input { display: none; }
+.settings { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; font: 12px var(--mono); color: var(--muted); }
+.settings label { display: flex; align-items: center; gap: 8px; }
+.settings input[type=range] { width: 120px; accent-color: var(--accent); }
+.legend { display: flex; gap: 12px; flex-wrap: wrap; font: 12px var(--mono); color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap" style="flex:1;display:flex;flex-direction:column;min-height:0">
+  <header>
+    <h1>Pyramid Detector v2 <small>speed test</small></h1>
+    <div class="status"><span id="st"><span class="dot"></span>Loading model…</span><span id="perf"></span></div>
+    <button class="ghost tiny" id="gear" aria-expanded="false" aria-controls="more">Settings</button>
+  </header>
+  <main>
+    <div class="stage" id="stage">
+      <canvas id="view" width="720" height="1280" aria-label="Camera view with detections"></canvas>
+      <div class="readout" id="readout">—</div>
+      <div class="pose" id="pose" hidden></div>
+      <div class="msg" id="msg" hidden></div>
+    </div>
+    <div class="modes" role="group" aria-label="View mode">
+      <button class="mode" data-mode="det" aria-pressed="false">Detection</button>
+      <button class="mode" data-mode="mesh" aria-pressed="false">Mesh &amp; measurements</button>
+      <button class="mode" data-mode="ring" aria-pressed="true">Ring</button>
+    </div>
+    <div class="dock">
+      <button id="live">Live camera</button>
+      <label class="btn">Take photo<input id="photo" type="file" accept="image/*" capture="environment"></label>
+      <label class="btn">Record video<input id="video" type="file" accept="video/*" capture="environment"></label>
+      <label class="btn ghost">From gallery<input id="pick" type="file" accept="image/*,video/*"></label>
+    </div>
+    <div id="more" class="more" hidden>
+    <div class="settings">
+      <label for="model">Model
+        <select id="model"><option value="small" selected>v2 small (accurate)</option><option value="nano">v2 nano (fast)</option></select></label>
+      <label for="backend">Engine
+        <select id="backend"><option value="auto" selected>Auto (GPU, else CPU)</option><option value="webgpu">GPU (WebGPU)</option><option value="wasm">CPU (multi-thread)</option></select></label>
+    </div>
+    <div class="settings">
+      <label for="thr">Min score <input id="thr" type="range" min="0.2" max="0.9" step="0.05" value="0.5"> <span id="thrv">0.50</span></label>
+      <label for="rate">Video speed
+        <select id="rate"><option value="1">1×</option><option value="0.5">0.5×</option><option value="0.25" selected>0.25×</option></select></label>
+      <label for="fov">Camera FOV <input id="fov" type="range" min="35" max="85" step="1" value="60"> <span id="fovv">60°</span></label>
+      <label for="pyr">Pyramid
+        <select id="pyr"><option value="khufu" selected>Khufu (230 m)</option><option value="khafre">Khafre (215 m)</option><option value="menkaure">Menkaure (103 m)</option></select></label>
+      <label for="step">Grid
+        <select id="step"><option value="5" selected>every 5%</option><option value="10">every 10%</option><option value="20">every 20%</option></select></label>
+      <button class="ghost" id="copy" style="padding:6px 10px">Copy pose JSON</button>
+      <button class="ghost" id="stop" style="padding:6px 10px">Stop</button>
+    </div>
+    <div class="legend"><span><i style="background:var(--k-apex)"></i>Apex</span><span><i style="background:var(--k-l)"></i>L corner</span><span><i style="background:var(--k-r)"></i>R corner</span><span><i style="background:var(--k-n)"></i>N near</span><span><i style="background:var(--k-f)"></i>F far</span><span>hollow = hidden / unsure</span></div>
+    </div>
+  </main>
+</div>
+
+<script src="ort/ort.webgpu.min.js"></script>
+<script src="three/three.min.js"></script>
+<script src="solver.js"></script>
+<script>
+const S = 480, N = 4725;
+const $ = id => document.getElementById(id);
+const view = $('view'), ctx = view.getContext('2d');
+const lb = document.createElement('canvas'); lb.width = lb.height = S;
+const lctx = lb.getContext('2d', { willReadFrequently: true });
+const KC = ['--k-apex', '--k-l', '--k-r', '--k-n', '--k-f'].map(v => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+const KN = ['A', 'L', 'R', 'N', 'F'];
+let session = null, busy = false, running = null, stream = null, mediaEl = null, prev = null, times = [];
+
+function status(text, cls) { $('st').innerHTML = `<span class="dot ${cls || ''}"></span>${text}`; }
+function msg(t) { $('msg').hidden = !t; $('msg').textContent = t || ''; }
+const thr = () => parseFloat($('thr').value);
+$('thr').oninput = () => { $('thrv').textContent = thr().toFixed(2); if (still) runStill(still); };
+
+const MODELS = { nano: ['models/nano.onnx'], small: ['models/small.part0', 'models/small.part1'] };
+async function fetchModel(name) {
+  const parts = []; let got = 0;
+  for (const [i, url] of MODELS[name].entries()) {
+    const res = await fetch(url); if (!res.ok) throw new Error('model download failed (' + res.status + ')');
+    const reader = res.body.getReader();
+    for (;;) { const { done, value } = await reader.read(); if (done) break; parts.push(value); got += value.length;
+      status(`Downloading ${name} model ${(got / 1e6).toFixed(0)} MB`); }
+  }
+  const buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; } return buf;
+}
+const modelCache = {};
+async function loadModel() {
+  const name = $('model').value, want = $('backend').value;
+  session = null; times = [];
+  ort.env.wasm.wasmPaths = new URL('ort/', location.href).href;
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+  const buf = modelCache[name] || (modelCache[name] = await fetchModel(name));
+  status('Starting engine…');
+  let used = 'CPU';
+  if (want !== 'wasm' && navigator.gpu) {
+    try { session = await ort.InferenceSession.create(buf, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' }); used = 'GPU'; }
+    catch (e) { console.warn('WebGPU failed, using CPU', e); }
+  }
+  if (!session) session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
+  const note = want === 'webgpu' && used !== 'GPU' ? ' (GPU not available here)' : '';
+  status(`${name} · ${used === 'GPU' ? 'GPU' : 'CPU ' + ort.env.wasm.numThreads + ' thread' + (ort.env.wasm.numThreads > 1 ? 's' : '')}${note}`, 'ok');
+}
+for (const id of ['model', 'backend']) $(id).onchange = () => loadModel().then(() => { if (still) runStill(still); }).catch(e => { status('Model failed to load', 'bad'); msg(e.message); });
+
+async function detect(src, w, h) {
+  if (!session) return { dets: [], ms: 0 };
+  const r = Math.min(S / w, S / h), nw = Math.round(w * r), nh = Math.round(h * r), dx = (S - nw) >> 1, dy = (S - nh) >> 1;
+  lctx.fillStyle = 'rgb(114,114,114)'; lctx.fillRect(0, 0, S, S); lctx.drawImage(src, dx, dy, nw, nh);
+  const px = lctx.getImageData(0, 0, S, S).data, f = new Float32Array(3 * S * S), A = S * S;
+  for (let i = 0, j = 0; i < A; i++, j += 4) { f[i] = px[j] / 255; f[i + A] = px[j + 1] / 255; f[i + 2 * A] = px[j + 2] / 255; }
+  const t0 = performance.now();
+  const out = await session.run({ [session.inputNames[0]]: new ort.Tensor('float32', f, [1, 3, S, S]) });
+  const ms = performance.now() - t0;
+  const d = out[session.outputNames[0]].data, c = thr(), cand = [];
+  for (let n = 0; n < N; n++) {
+    const s = d[4 * N + n]; if (s < c) continue;
+    const cx = d[n], cy = d[N + n], bw = d[2 * N + n], bh = d[3 * N + n];
+    const k = []; for (let j = 0; j < 5; j++) k.push([(d[(5 + 3 * j) * N + n] - dx) / r, (d[(6 + 3 * j) * N + n] - dy) / r, d[(7 + 3 * j) * N + n]]);
+    cand.push({ s, b: [(cx - bw / 2 - dx) / r, (cy - bh / 2 - dy) / r, (cx + bw / 2 - dx) / r, (cy + bh / 2 - dy) / r], k });
+  }
+  cand.sort((a, b) => b.s - a.s); const keep = [];
+  const iou = (a, b) => { const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]), x2 = Math.min(a[2], b[2]), y2 = Math.min(a[3], b[3]);
+    const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1); return i / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i); };
+  for (const p of cand) if (keep.every(q => iou(p.b, q.b) < 0.5)) keep.push(p);
+  keep.sort((a, b) => b.s - a.s);   // most confident first: that one drives the 3D pose
+  return { dets: keep, ms };
+}
+
+function smooth(dets, w) {
+  if (!dets.length) { prev = null; return dets; }
+  const m = dets[0];
+  if (prev && Math.hypot(m.k[0][0] - prev.k[0][0], m.k[0][1] - prev.k[0][1]) < 0.15 * w) {
+    const a = 0.5; m.k.forEach((p, j) => { p[0] = a * prev.k[j][0] + (1 - a) * p[0]; p[1] = a * prev.k[j][1] + (1 - a) * p[1]; });
+    m.b = m.b.map((v, j) => a * prev.b[j] + (1 - a) * v);
+  }
+  prev = JSON.parse(JSON.stringify(m)); return dets;
+}
+
+function fitCanvas(w, h) { if (view.width !== w || view.height !== h) { view.width = w; view.height = h; } }
+// ---- 3D pose ----
+let poseState = null, tilt = null, lastPose = null;
+const fovDeg = () => parseFloat($('fov').value);
+$('fov').oninput = () => { $('fovv').textContent = fovDeg() + '°'; poseState = null; if (still) runStill(still); };
+$('gear').onclick = () => { const open = $('more').hidden; $('more').hidden = !open; $('gear').setAttribute('aria-expanded', String(open)); $('gear').textContent = open ? 'Close' : 'Settings'; };
+let mode = 'ring';
+document.querySelectorAll('.mode').forEach(b => b.onclick = () => {
+  mode = b.dataset.mode; document.querySelectorAll('.mode').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  if (still) runStill(still);
+});
+// real dimensions: base (m), original height to the tip (m), current top (m)
+const PYR = { khufu: { base: 230.33, h: 146.6, top: 138.5 }, khafre: { base: 215.25, h: 143.5, top: 136.4 }, menkaure: { base: 103.4, h: 65.5, top: 61 } };
+const pyr = () => PYR[$('pyr').value];
+for (const id of ['pyr', 'step']) $(id).onchange = () => { poseState = null; if (still) runStill(still); };
+function camFor(w, h) { return { f: (Math.max(w, h) / 2) / Math.tan(fovDeg() * Math.PI / 360), cx: w / 2, cy: h / 2 }; }
+function solvePose(dets, w, h, useTilt) {
+  if (!dets.length) { poseState = null; return null; }
+  const d = dets[0], cam = camFor(w, h);
+  const up = useTilt && tilt ? PyramidSolver.upFromOrientation(tilt.beta, tilt.gamma, tilt.angle) : null;
+  const H = pyr().h / pyr().base;
+  let sol = PyramidSolver.solve(d.k, cam, { init: poseState, box: d.b, up, H });
+  if (!(sol.p && sol.ok) && poseState) sol = PyramidSolver.solve(d.k, cam, { box: d.b, up, H });
+  if (!(sol.p && sol.ok)) { poseState = null; return null; }
+  poseState = sol;
+  const three = PyramidSolver.threePose(sol), dist = Math.hypot(sol.C[0], sol.C[2]);
+  lastPose = { time: Date.now(), units: 'pyramid base = 1', pyramid: $('pyr').value, metres_per_unit: pyr().base, image: { width: w, height: h }, intrinsics: { fx: cam.f, fy: cam.f, cx: cam.cx, cy: cam.cy, fov_long_side_deg: fovDeg() },
+    camera_position: sol.C.map(v => +v.toFixed(4)), camera_quaternion_threejs: three.quaternion.map(v => +v.toFixed(5)),
+    world_to_camera_opencv: { R: sol.R.map(v => +v.toFixed(6)), t: sol.t.map(v => +v.toFixed(5)) }, fit_error_px: +sol.err.toFixed(2), tilt_sensor: !!up, score: +d.s.toFixed(3) };
+  window.pyramidPose = lastPose;
+  $('pose').hidden = false;
+  $('pose').textContent = `${$('pyr').value} · distance ~${Math.round(dist * pyr().base)} m from centre · eye height ${(sol.C[1] * pyr().base).toFixed(0)} m · bearing ${(((Math.atan2(sol.C[0], sol.C[2]) * 180 / Math.PI) % 90 + 90) % 90).toFixed(0)}°\nfit ${sol.err.toFixed(1)} px · ${sol.used}/5 points · tilt sensor ${up ? 'on' : 'off'}`;
+  return { sol, cam };
+}
+// ---- ring demo: three.js scene in pyramid units (base = 1), hidden pyramid mesh hides what is behind it ----
+let R3 = null;
+function ringScene() {
+  if (R3 || typeof THREE === 'undefined') return R3;
+  const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+  renderer.setPixelRatio(1); renderer.setClearColor(0x000000, 0);
+  const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(50, 1, 0.01, 200);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const sun = new THREE.DirectionalLight(0xfff1d6, 1.6); sun.position.set(2, 3, 1.5); scene.add(sun);
+  // occluder: the hidden pyramid writes depth only, so anything behind it is not drawn
+  const occ = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ colorWrite: false }));
+  occ.renderOrder = 0; scene.add(occ);
+  const gold = new THREE.MeshStandardMaterial({ color: 0xffc94a, emissive: 0x8a5a00, emissiveIntensity: 0.9, metalness: 0.6, roughness: 0.3 });
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(1, 0.018, 16, 160), gold); ring.renderOrder = 1; scene.add(ring);
+  const ring2 = new THREE.Mesh(new THREE.TorusGeometry(1, 0.008, 12, 160), new THREE.MeshStandardMaterial({ color: 0x8fe3ff, emissive: 0x1d6f8a, emissiveIntensity: 1 })); ring2.renderOrder = 1; scene.add(ring2);
+  const orb = new THREE.Mesh(new THREE.SphereGeometry(0.035, 24, 16), new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffd27a, emissiveIntensity: 1.5 })); orb.renderOrder = 1; scene.add(orb);
+  R3 = { renderer, scene, camera, occ, ring, ring2, orb, occH: null };
+  return R3;
+}
+function setOccluder(H, cut) {        // truncated square pyramid, base 1, real flat top at `cut`
+  const b = 0.5, tt = b * (1 - cut / H);
+  const v = [[-b,0,-b],[b,0,-b],[b,0,b],[-b,0,b],[-tt,cut,-tt],[tt,cut,-tt],[tt,cut,tt],[-tt,cut,tt]];
+  const f = [0,4,5, 0,5,1, 1,5,6, 1,6,2, 2,6,7, 2,7,3, 3,7,4, 3,4,0, 4,7,6, 4,6,5, 0,1,2, 0,2,3];
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(v.flat(), 3)); g.setIndex(f);
+  R3.occ.geometry.dispose(); R3.occ.geometry = g; R3.occH = H + ':' + cut;
+}
+function drawRing(ps, w, h) {
+  const r3 = ringScene(); if (!r3) { msg('3D library did not load, so the ring demo is unavailable. The grid views still work.'); return; }
+  const P = pyr(), H = P.h / P.base, cut = P.top / P.base;
+  if (r3.occH !== H + ':' + cut) setOccluder(H, cut);
+  const t = performance.now() / 1000;
+  // ring rides up and down the pyramid, hugging it: radius = corner distance at that height + margin
+  const y = H * (0.18 + 0.32 * (0.5 + 0.5 * Math.sin(t * 0.6)));
+  const rad = 0.7071 * (1 - y / H) * 1.18 + 0.03;
+  r3.ring.position.set(0, y, 0); r3.ring.scale.setScalar(rad); r3.ring.rotation.set(Math.PI / 2 + 0.12 * Math.sin(t * 0.9), 0, t * 0.8);
+  const y2 = H * 0.12, rad2 = 0.7071 * (1 - y2 / H) * 1.3;
+  r3.ring2.position.set(0, y2, 0); r3.ring2.scale.setScalar(rad2); r3.ring2.rotation.set(Math.PI / 2, 0, 0);
+  const a = t * 1.4; r3.orb.position.set(Math.cos(a) * rad2, y2, Math.sin(a) * rad2);
+  // camera = solved phone camera
+  const tp = PyramidSolver.threePose(ps.sol), cam = r3.camera;
+  cam.fov = 2 * Math.atan(h / 2 / ps.cam.f) * 180 / Math.PI; cam.aspect = w / h; cam.updateProjectionMatrix();
+  cam.position.set(...tp.position); cam.quaternion.set(...tp.quaternion);
+  if (r3.renderer.domElement.width !== w || r3.renderer.domElement.height !== h) r3.renderer.setSize(w, h, false);
+  r3.renderer.render(r3.scene, cam);
+  ctx.drawImage(r3.renderer.domElement, 0, 0, w, h);
+}
+// modes: det = detected points only; mesh = 3D mesh + measurements; ring = mesh + the ring inserted on it
+function drawPose(ps, w) {
+  if (!ps || mode === 'det') return;
+  if (mode === 'ring') { drawRing(ps, w, view.height); return; }   // ring only: the mesh stays invisible
+  drawMesh(ps, w);
+}
+function drawMesh(ps, w) {
+  const P = pyr(), step = +$('step').value / 100, L = Math.max(2, w / 360);
+  const levels = [], lons = [];
+  for (let k = 1; k * step < P.top / P.h - 1e-6; k++) levels.push(+(k * step).toFixed(4));   // fraction of height
+  for (let k = 1; k * step < 1 - 1e-6; k++) lons.push(+(k * step).toFixed(4));               // fraction along each base edge
+  const wf = PyramidSolver.wireframe(ps.sol, ps.cam, { levels, lons });
+  const major = f => Math.abs(f * 10 - Math.round(f * 10)) < 1e-6;                          // every 10% is drawn heavier
+  // grid
+  for (const g of wf.grid) {
+    ctx.lineWidth = major(g.frac) ? Math.max(1, L * 0.6) : Math.max(0.5, L * 0.3);
+    ctx.strokeStyle = g.kind === 'lat' ? 'rgba(255,210,63,.8)' : 'rgba(120,200,255,.75)';
+    ctx.beginPath(); ctx.moveTo(g[0].u, g[0].v); ctx.lineTo(g[1].u, g[1].v); ctx.stroke();
+  }
+  // edges
+  for (const e of wf.edges) {
+    ctx.setLineDash(e.visible ? [] : [L * 4, L * 4]); ctx.lineWidth = e.visible ? L * 1.4 : L * 0.8;
+    ctx.strokeStyle = e.visible ? '#39f07a' : 'rgba(255,140,60,.9)'; ctx.beginPath(); ctx.moveTo(e.a.u, e.a.v); ctx.lineTo(e.b.u, e.b.v); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  // labels
+  const sc = Math.min((view.clientWidth || view.width) / view.width, (view.clientHeight || view.height) / view.height);
+  const k = 1 / Math.max(1e-3, sc);   // image px per screen px (canvas is letterboxed with object-fit: contain)
+  const fs = Math.round(11 * k), tick = 8 * k;
+  ctx.font = `600 ${fs}px IBM Plex Mono, monospace`; ctx.textBaseline = 'middle';
+  const label = (x, y, text, col, align) => {
+    ctx.textAlign = align; ctx.fillStyle = col; ctx.fillText(text, x, y);
+  };
+  // heights: one label per level at the right-hand silhouette, written as "—— 40 m"
+  let lastY = Infinity;
+  for (const s of levels) {
+    const ends = wf.grid.filter(g => g.kind === 'lat' && g.frac === s).flatMap(g => [g[0], g[1]]);
+    if (!ends.length) continue;
+    const r = ends.reduce((a, b) => (b.u > a.u ? b : a));
+    if (!major(s) && step < 0.1) continue;
+    if (Math.abs(r.v - lastY) < fs * 1.1) continue; lastY = r.v;
+    ctx.strokeStyle = 'rgba(255,210,63,.95)'; ctx.lineWidth = Math.max(1, L * 0.6); ctx.beginPath(); ctx.moveTo(r.u + L * 2, r.v); ctx.lineTo(r.u + L * 2 + tick, r.v); ctx.stroke();
+    label(r.u + L * 3 + tick, r.v, `${Math.round(s * 100)}% h`, '#ffd23f', 'left');
+  }
+  // along the base: label each longitude line where it meets the ground, per visible face
+  for (let f = 0; f < 4; f++) {
+    if (!wf.faces[f]) continue; let lastX = null;
+    for (const g of wf.grid.filter(g => g.kind === 'lon' && g.face === f)) {
+      const b = g[0];
+      if (Math.abs(g.frac * 4 - Math.round(g.frac * 4)) > 1e-6) continue;   // 25 / 50 / 75 % only
+      if (lastX !== null && Math.abs(b.u - lastX) < fs * 2.6) continue; lastX = b.u;
+      ctx.strokeStyle = 'rgba(120,200,255,.95)'; ctx.lineWidth = Math.max(1, L * 0.6); ctx.beginPath(); ctx.moveTo(b.u, b.v + L * 2); ctx.lineTo(b.u, b.v + L * 2 + tick * 0.6); ctx.stroke();
+      label(b.u, b.v + L * 4 + tick * 0.6 + fs * 0.5, `${Math.round(g.frac * 100)}%`, '#8fd0ff', 'center');
+    }
+  }
+  // apex height
+  const ap = wf.P[4]; label(ap.u + fs * 0.6, ap.v - fs * 0.6, '100% h', '#39f07a', 'left');
+  ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+}
+$('copy').onclick = () => {
+  const t = JSON.stringify(lastPose || { note: 'no pose yet' }, null, 1);
+  (navigator.clipboard?.writeText(t) || Promise.reject()).then(() => msg('Pose JSON copied')).catch(() => msg(t));
+};
+
+function drawDets(dets, w) {
+  if (mode !== 'det') return;
+  const L = Math.max(2, w / 360);
+  for (const d of dets) {
+    const k = d.k, ok = k.map(p => p[2] > 0.5), P = k.map(p => [p[0], p[1]]);
+    ctx.strokeStyle = '#e8b04b'; ctx.lineWidth = L; ctx.strokeRect(d.b[0], d.b[1], d.b[2] - d.b[0], d.b[3] - d.b[1]);
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = L * 1.2; ctx.beginPath();
+    const seg = (a, b) => { ctx.moveTo(...P[a]); ctx.lineTo(...P[b]); };
+    for (const j of [1, 2, 3]) if (ok[0] && ok[j]) seg(0, j);
+    if (ok[1] && ok[3]) seg(1, 3); if (ok[3] && ok[2]) seg(3, 2); if (ok[1] && ok[2] && !ok[3]) seg(1, 2);
+    ctx.stroke();
+    k.forEach((p, j) => { if (p[2] < 0.2) return; ctx.beginPath(); ctx.arc(p[0], p[1], L * 3.2, 0, 7);
+      if (ok[j]) { ctx.fillStyle = KC[j]; ctx.fill(); } else { ctx.strokeStyle = KC[j]; ctx.lineWidth = L; ctx.stroke(); }
+      ctx.fillStyle = KC[j]; ctx.font = `600 ${Math.round(L * 7)}px IBM Plex Mono, monospace`; ctx.fillText(KN[j], p[0] + L * 4, p[1] - L * 3); });
+    ctx.fillStyle = '#e8b04b'; ctx.font = `600 ${Math.round(L * 7)}px IBM Plex Mono, monospace`; ctx.fillText(d.s.toFixed(2), d.b[0], Math.max(L * 8, d.b[1] - L * 3));
+  }
+}
+function report(dets, ms) {
+  times.push(ms); if (times.length > 20) times.shift();
+  const avg = times.reduce((a, b) => a + b, 0) / times.length;
+  $('perf').textContent = `${avg.toFixed(0)} ms/frame · ${(1000 / avg).toFixed(1)} fps model`;
+  $('readout').textContent = dets.length ? `${dets.length} pyramid${dets.length > 1 ? 's' : ''} · score ${dets[0].s.toFixed(2)}` : 'no pyramid';
+}
+
+let still = null;
+async function runStill(img) {
+  stopAll(); still = img; const w = img.naturalWidth, h = img.naturalHeight;
+  fitCanvas(w, h); ctx.drawImage(img, 0, 0);
+  const { dets, ms } = await detect(img, w, h); prev = null; poseState = null; const ps = solvePose(dets, w, h, false); report(dets, ms);
+  const token = {}; running = token;
+  const paint = () => { if (running !== token || still !== img) return; ctx.drawImage(img, 0, 0); drawPose(ps, w); drawDets(dets, w);
+    if (mode === 'ring' && ps) requestAnimationFrame(paint); };
+  paint();
+}
+
+function loopMedia(el, isLive) {
+  mediaEl = el; const token = {}; running = token; prev = null; times = []; still = null; poseState = null;
+  let last = { dets: [], ps: null };
+  const frame = async () => {
+    if (running !== token) return;
+    const w = el.videoWidth, h = el.videoHeight;
+    if (w && h) {
+      fitCanvas(w, h); ctx.drawImage(el, 0, 0, w, h); drawPose(last.ps, w); drawDets(last.dets, w);
+      if (!busy) { busy = true; const snap = document.createElement('canvas'); snap.width = w; snap.height = h; snap.getContext('2d').drawImage(el, 0, 0, w, h);
+        detect(snap, w, h).then(r => { if (running === token) { const ds = smooth(r.dets, w); last = { dets: ds, ps: solvePose(ds, w, h, isLive) }; report(r.dets, r.ms); } }).catch(e => msg('Model error: ' + e.message)).finally(() => busy = false); }
+    }
+    if (!isLive && el.ended) { msg('Video finished · pick another or press Live camera'); return; }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+function stopAll(clearStill = true) {
+  running = null; if (clearStill) still = null;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (mediaEl) { try { mediaEl.pause(); } catch (e) {} if (mediaEl.src && mediaEl.src.startsWith('blob:')) URL.revokeObjectURL(mediaEl.src); mediaEl = null; }
+}
+$('stop').onclick = () => { stopAll(false); msg('Stopped'); };
+
+// Back camera first: exact 'environment', then a device labelled back/rear, then whatever the browser gives.
+async function openBackCamera() {
+  const size = { width: { ideal: 1280 }, height: { ideal: 720 } };
+  try { return await navigator.mediaDevices.getUserMedia({ video: { facingMode: { exact: 'environment' }, ...size }, audio: false }); } catch (e) {}
+  const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, ...size }, audio: false });
+  const cur = s.getVideoTracks()[0];
+  if (/back|rear|environment|خلف/i.test(cur.label) || cur.getSettings().facingMode === 'environment') return s;
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const back = cams.find(d => /back|rear|environment|خلف/i.test(d.label));
+  if (!back) return s;
+  s.getTracks().forEach(t => t.stop());
+  return navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: back.deviceId }, ...size }, audio: false });
+}
+function startTilt() {
+  const on = e => { if (e.beta == null) return; tilt = { beta: e.beta, gamma: e.gamma, angle: (screen.orientation && screen.orientation.angle) || window.orientation || 0 }; };
+  const add = () => window.addEventListener('deviceorientation', on);
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function')
+    return DeviceOrientationEvent.requestPermission().then(r => { if (r === 'granted') add(); }).catch(() => {});
+  add(); return Promise.resolve();
+}
+$('live').onclick = async () => {
+  const tiltReq = startTilt();
+  msg('');
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('no camera API');
+    stopAll();
+    stream = await openBackCamera();
+    const v = document.createElement('video'); v.playsInline = true; v.muted = true; v.srcObject = stream; await v.play();
+    loopMedia(v, true);
+  } catch (e) {
+    msg('Live camera is blocked on this page. Use "Take photo" or "Record video" — they open your phone camera and run the same model on the result. Live mode works when this page is hosted on a regular https site.');
+  }
+};
+
+function handleFile(file) {
+  if (!file || !session) return; msg('');
+  const url = URL.createObjectURL(file);
+  if (file.type.startsWith('video')) {
+    stopAll(); const v = document.createElement('video'); v.playsInline = true; v.muted = true; v.src = url;
+    v.playbackRate = parseFloat($('rate').value);
+    v.onloadeddata = () => { v.play().then(() => loopMedia(v, false)).catch(() => msg('Could not play this video')); };
+    v.onerror = () => msg('This video format could not be opened in the browser. Try recording in H.264 / "Most compatible".');
+  } else {
+    const img = new Image(); img.onload = () => runStill(img); img.onerror = () => msg('Could not open this image'); img.src = url;
+  }
+}
+for (const id of ['photo', 'video', 'pick']) $(id).onchange = e => { handleFile(e.target.files[0]); e.target.value = ''; };
+$('rate').onchange = () => { if (mediaEl && !mediaEl.srcObject) mediaEl.playbackRate = parseFloat($('rate').value); };
+
+// at rest: draw the sample photo, then detect once the model is ready
+const sample = new Image(); sample.src = 'sample.jpg';
+sample.onload = () => { fitCanvas(sample.naturalWidth, sample.naturalHeight); ctx.drawImage(sample, 0, 0); $('readout').textContent = 'sample photo · loading model'; };
+loadModel().then(() => sample.complete ? runStill(sample) : (sample.onload = () => runStill(sample)))
+  .catch(e => { status('Model failed to load', 'bad'); msg(e.message); });
+</script>
+
+</body></html>
