@@ -354,6 +354,13 @@
     return { dx: f * D[2] / D[8], dy: f * D[5] / D[8], roll: Math.atan2(D[3], D[0]) };
   }
 
-  const api = { solve, plausible, GATE, makeStabilizer, blendRot, blendSol, stabilizeOffset, makeOrientationHistory, imageShift, makeDelayCalibrator, deviceQ, camFromDevice, turnBetween, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
+  // A pose found in a picture turned by `roll` (radians, clockwise on screen) about its centre -> the same pose in the
+  // original picture. Turning a picture about its centre is the same as turning the camera about its viewing axis.
+  function rollSol(sol, roll) {
+    if (!sol || !sol.p) return sol;
+    const c = Math.cos(roll), s = Math.sin(roll), Z = [c, -s, 0, s, c, 0, 0, 0, 1];
+    return solFrom(mm(Z, sol.R), sol.C, sol);
+  }
+  const api = { solve, plausible, GATE, makeStabilizer, rollSol, blendRot, blendSol, stabilizeOffset, makeOrientationHistory, imageShift, makeDelayCalibrator, deviceQ, camFromDevice, turnBetween, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
   if (typeof module !== 'undefined') module.exports = api; else root.PyramidSolver = api;
 })(typeof self !== 'undefined' ? self : this);

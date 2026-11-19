@@ -195,6 +195,32 @@ async function detect(src, w, h) {
   return { dets: keep, ms };
 }
 
+// The model was trained on upright views. When the phone is turned (tilted sideways, or held landscape with rotation
+// locked), straighten the frame using the tilt sensor before detection, then turn the results back.
+const RC = document.createElement('canvas'), rcx = RC.getContext('2d');
+function rollFromTilt() {                 // how far the picture is turned from upright, radians (clockwise on screen)
+  if (!tilt) return 0;
+  const u = PyramidSolver.upFromOrientation(tilt.beta, tilt.gamma, tilt.angle);
+  if (Math.hypot(u[0], u[1]) < 0.35) return 0;   // pointing almost straight up or down: no clear "up" in the picture
+  return Math.atan2(u[0], -u[1]);
+}
+async function detectUpright(src, w, h, roll) {
+  if (Math.abs(roll) < 0.14) return detect(src, w, h);          // under ~8°: the model copes on its own
+  const c = Math.cos(roll), s = Math.sin(roll), W = Math.ceil(Math.abs(w * c) + Math.abs(h * s)), H = Math.ceil(Math.abs(w * s) + Math.abs(h * c));
+  if (RC.width !== W || RC.height !== H) { RC.width = W; RC.height = H; }
+  rcx.setTransform(1, 0, 0, 1, 0, 0); rcx.fillStyle = 'rgb(114,114,114)'; rcx.fillRect(0, 0, W, H);
+  rcx.translate(W / 2, H / 2); rcx.rotate(-roll); rcx.drawImage(src, -w / 2, -h / 2, w, h);
+  const r = await detect(RC, W, H);
+  const back = (x, y) => { const dx = x - W / 2, dy = y - H / 2; return [c * dx - s * dy + w / 2, s * dx + c * dy + h / 2]; };
+  for (const d of r.dets) {
+    d.up = { k: d.k.map(p => p.slice()), b: d.b.slice(), W, H, roll };   // upright copy: the pose is fitted here
+    d.k = d.k.map(p => [...back(p[0], p[1]), p[2]]);
+    const q = [back(d.b[0], d.b[1]), back(d.b[2], d.b[1]), back(d.b[0], d.b[3]), back(d.b[2], d.b[3])];
+    d.b = [Math.min(...q.map(p => p[0])), Math.min(...q.map(p => p[1])), Math.max(...q.map(p => p[0])), Math.max(...q.map(p => p[1]))];
+  }
+  r.roll = roll; return r;
+}
+
 function smooth(dets, w) {
   if (!dets.length) { prev = null; return dets; }
   const m = dets[0];
@@ -272,9 +298,11 @@ function drawTags(dets, w) {          // numbered markers above each pyramid whe
   if (dets.length < 2) return;
   const sc = Math.min((view.clientWidth || view.width) / view.width, (view.clientHeight || view.height) / view.height);
   const k = 1 / Math.max(1e-3, sc), R = 11 * k, order = leftToRight(dets);
+  const roll = stream && mediaEl ? rollFromTilt() : 0;
   ctx.font = `700 ${Math.round(12 * k)}px IBM Plex Mono, monospace`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   order.forEach((i, n) => {
-    const d = dets[i], sel = i === 0 && (!target || target.lost === 0), x = d.k[0][0], y = Math.max(R + 2, d.k[0][1] - R * 2.2);
+    const d = dets[i], sel = i === 0 && (!target || target.lost === 0), ux = Math.sin(roll), uy = -Math.cos(roll);   // "up" in the scene
+    const x = d.k[0][0] + ux * R * 2.2, y = Math.max(R + 2, d.k[0][1] + uy * R * 2.2);
     ctx.beginPath(); ctx.arc(x, y, R, 0, 7); ctx.fillStyle = sel ? '#ffc94a' : 'rgba(18,16,13,.75)'; ctx.fill();
     ctx.lineWidth = 1.5 * k; ctx.strokeStyle = sel ? '#ffc94a' : 'rgba(255,255,255,.85)'; ctx.stroke();
     ctx.fillStyle = sel ? '#12100d' : '#fff'; ctx.fillText(String(n + 1), x, y + k);
@@ -322,15 +350,19 @@ function solvePose(dets, w, h, useTilt) {
   const d = dets[0], cam = camFor(w, h);
   const up = useTilt && tilt ? PyramidSolver.upFromOrientation(tilt.beta, tilt.gamma, tilt.angle) : null;
   const H = pyr().h / pyr().base, gcfg = target ? GATE_USER : PyramidSolver.GATE;
+  // phone turned: fit in the straightened picture (where "up" is up), then turn the pose back
+  const U = d.up, rz = U ? U.roll : 0, kk = U ? U.k : d.k, bb = U ? U.b : d.b, cc = U ? { f: cam.f, cx: U.W / 2, cy: U.H / 2 } : cam;
+  const rotUp = u => u && rz ? [Math.cos(rz) * u[0] + Math.sin(rz) * u[1], -Math.sin(rz) * u[0] + Math.cos(rz) * u[1], u[2]] : u;
+  const init = poseState && rz ? PyramidSolver.rollSol(poseState, -rz) : poseState;
   const attempt = u => {
-    let s = PyramidSolver.solve(d.k, cam, { init: poseState, box: d.b, up: u, H });
-    if (!(s.p && s.ok) && poseState) s = PyramidSolver.solve(d.k, cam, { box: d.b, up: u, H });
+    let s = PyramidSolver.solve(kk, cc, { init, box: bb, up: rotUp(u), H });
+    if (!(s.p && s.ok) && init) s = PyramidSolver.solve(kk, cc, { box: bb, up: rotUp(u), H });
     if (!(s.p && s.ok)) return { fail: 'shape does not match a pyramid' };
     if ($('gate').checked) {   // is it physically a pyramid seen from where a person can stand?
-      const g = PyramidSolver.plausible(s, d.k, d.b, cam, u, gcfg);
+      const g = PyramidSolver.plausible(s, kk, bb, cc, rotUp(u), gcfg);
       if (!g.ok) return { fail: g.reason };
     }
-    return { sol: s };
+    return { sol: rz ? PyramidSolver.rollSol(s, rz) : s };
   };
   // The tilt sensor helps at the real site. A photo on a screen has its own horizon, which won't match the phone's tilt,
   // so if the fit fails with the sensor, try again without it.
@@ -585,7 +617,7 @@ function loopMedia(el, isLive) {
       ctx.drawImage(el, 0, 0, w, h); drawPose(drawPs, w); drawDets(last.dets, w); drawTags(last.dets, w);
       if (!busy) { busy = true; const snap = document.createElement('canvas'); snap.width = w; snap.height = h; snap.getContext('2d').drawImage(el, 0, 0, w, h);
         const qSnap = steady ? ohist.at(ft - delayMs()) : null;    // how the phone was turned when this frame was taken
-        detect(snap, w, h).then(r => { if (running !== token) return;
+        detectUpright(snap, w, h, isLive ? rollFromTilt() : 0).then(r => { if (running !== token) return;
           if (switched) return;                                       // a tap came in while this frame was being read: the next frame handles it
           const picked = pickTarget(r.dets);
           if (target && target.size) $('pyr').value = target.size;
