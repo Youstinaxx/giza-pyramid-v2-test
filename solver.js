@@ -74,6 +74,10 @@
     }
     const C = mtv(rodrigues(p), [-p[3], -p[4], -p[5]]);
     out.push(C[1] < 0 ? -C[1] * cam.f : 0);        // stay above the ground
+    if (opt.prior) {                               // you don't teleport: stay near where the camera has been recently
+      const P = opt.prior, d = Math.max(0.3, Math.hypot(P[0], P[2])), s = cam.f * opt.priorWeight / d;
+      out.push((C[0] - P[0]) * s, (C[1] - P[1]) * s * 3, (C[2] - P[2]) * s);
+    }
     return out;
   }
 
@@ -129,7 +133,7 @@
   }
 
   function solve(kp, cam, o = {}) {
-    const opt = { H: o.H || H_DEFAULT, up: o.up ? norm(o.up) : null, gravityWeight: o.gravityWeight ?? 0.3, minConf: o.minConf ?? 0.5 };
+    const opt = { H: o.H || H_DEFAULT, up: o.up ? norm(o.up) : null, gravityWeight: o.gravityWeight ?? 0.3, minConf: o.minConf ?? 0.5, prior: o.prior || null, priorWeight: o.priorWeight ?? 0.15 };
     if (!kp[0] || kp[0][2] < 0.5) return { ok: false, reason: 'apex not found' };
     const starts = [];
     if (o.init && o.init.p) starts.push(o.init.p);
@@ -142,7 +146,7 @@
     if (!best) return { ok: false, reason: 'no solution' };
     const used = 1 + kp.slice(1).filter(k => k && k[2] >= opt.minConf).length;
     const R = rodrigues(best.p), t = best.p.slice(3), C = mtv(R, t.map(x => -x));
-    const rp = residuals(best.p, kp, cam, { ...opt, up: null });
+    const rp = residuals(best.p, kp, cam, { ...opt, up: null, prior: null });
     const px = Math.sqrt(sse(rp) / Math.max(1, used));       // RMS reprojection error per point (px, conf-weighted)
     return { ok: px < 0.06 * cam.f, p: best.p, R, t, C, err: px, used, H: opt.H };
   }

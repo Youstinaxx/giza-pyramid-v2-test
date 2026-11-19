@@ -113,6 +113,7 @@ button:disabled { opacity: .45; cursor: default; }
       <label for="gate"><input id="gate" type="checkbox" checked> Triangle filter</label>
       <label for="steadycam"><input id="steadycam" type="checkbox" checked> Steady camera</label>
       <label for="steady"><input id="steady" type="checkbox" checked> Ring follows gyro</label>
+      <label for="anim"><input id="anim" type="checkbox"> Ring animation</label>
       <label for="delay">Camera delay
         <select id="delay"><option value="auto" selected>auto</option><option value="0">0 ms</option><option value="40">40 ms</option><option value="80">80 ms</option><option value="120">120 ms</option><option value="160">160 ms</option><option value="200">200 ms</option></select></label>
       <button class="ghost" id="copy" style="padding:6px 10px">Copy pose JSON</button>
@@ -234,6 +235,7 @@ function smooth(dets, w) {
 // ---- choosing one pyramid when several are in view ----
 // target = the pyramid the user picked; it is followed frame to frame by position, so the ring stays on it.
 let target = null, lastDets = [], switched = false, viewXform = null, shownSol = null;
+let cHist = [], sensorOffUntil = 0;   // recent camera positions (you don't teleport), and when to trust the tilt sensor again
 const GLIDE_MS = 450, ease = k => k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
 const centre = b => [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
 function matchCost(a, b) {            // 0 = same box; ~1 = moved a full box width, or very different size
@@ -243,8 +245,13 @@ function matchCost(a, b) {            // 0 = same box; ~1 = moved a full box wid
 }
 const leftToRight = dets => dets.map((d, i) => i).sort((i, j) => centre(dets[i].b)[0] - centre(dets[j].b)[0]);
 // Put the chosen pyramid first (the one that drives the pose). Returns [] when the chosen one is out of view.
+let autoB = null;   // automatic mode also sticks to one pyramid instead of hopping to whichever scores highest
 function pickTarget(dets) {
-  if (!target) return dets;
+  if (!target) {
+    if (!autoB || dets.length < 2) return dets;
+    let bi = -1, bc = Infinity; dets.forEach((d, i) => { const c = matchCost(d.b, autoB); if (c < bc) { bc = c; bi = i; } });
+    return bc < 0.7 ? [dets[bi], ...dets.filter((_, i) => i !== bi)] : dets;
+  }
   let best = -1, bc = Infinity;
   dets.forEach((d, i) => { const c = matchCost(d.b, target.b); if (c < bc) { bc = c; best = i; } });
   if (best >= 0 && bc < 0.7) { target.b = dets[best].b.slice(); target.lost = 0; return [dets[best], ...dets.filter((_, i) => i !== best)]; }
@@ -254,7 +261,7 @@ function pickTarget(dets) {
 function choose(d) {
   target = d ? { b: d.b.slice(), lost: 0, size: (target && matchCost(d.b, target.b) < 0.7 ? target.size : null) || guessSize(d) } : null;
   if (target) $('pyr').value = target.size;
-  poseState = null; prev = null; switched = true;
+  poseState = null; prev = null; switched = true; cHist = []; autoB = null;
   if (still) renderStill(true); else updateSwitch(lastDets);
 }
 function guessSize(d) {   // with all three in view, the clearly smallest is Menkaure; otherwise keep the current setting
@@ -354,9 +361,10 @@ function solvePose(dets, w, h, useTilt) {
   const U = d.up, rz = U ? U.roll : 0, kk = U ? U.k : d.k, bb = U ? U.b : d.b, cc = U ? { f: cam.f, cx: U.W / 2, cy: U.H / 2 } : cam;
   const rotUp = u => u && rz ? [Math.cos(rz) * u[0] + Math.sin(rz) * u[1], -Math.sin(rz) * u[0] + Math.cos(rz) * u[1], u[2]] : u;
   const init = poseState && rz ? PyramidSolver.rollSol(poseState, -rz) : poseState;
+  const prior = cHist.length >= 3 ? [0, 1, 2].map(i => cHist.map(c => c[i]).sort((a, b) => a - b)[cHist.length >> 1]) : null;
   const attempt = u => {
-    let s = PyramidSolver.solve(kk, cc, { init, box: bb, up: rotUp(u), H });
-    if (!(s.p && s.ok) && init) s = PyramidSolver.solve(kk, cc, { box: bb, up: rotUp(u), H });
+    let s = PyramidSolver.solve(kk, cc, { init, box: bb, up: rotUp(u), H, prior });
+    if (!(s.p && s.ok) && init) s = PyramidSolver.solve(kk, cc, { box: bb, up: rotUp(u), H, prior });
     if (!(s.p && s.ok)) return { fail: 'shape does not match a pyramid' };
     if ($('gate').checked) {   // is it physically a pyramid seen from where a person can stand?
       const g = PyramidSolver.plausible(s, kk, bb, cc, rotUp(u), gcfg);
@@ -364,12 +372,18 @@ function solvePose(dets, w, h, useTilt) {
     }
     return { sol: rz ? PyramidSolver.rollSol(s, rz) : s };
   };
-  // The tilt sensor helps at the real site. A photo on a screen has its own horizon, which won't match the phone's tilt,
-  // so if the fit fails with the sensor, try again without it.
-  let r = attempt(up), tiltUse = up ? 'on' : 'off';
-  if (r.fail && up) { const r2 = attempt(null); if (!r2.fail) { r = r2; tiltUse = 'ignored (picture or screen?)'; } }
+  // The tilt sensor helps at the real site. A photo on a screen has its own horizon, which won't match the phone's tilt.
+  // Fit both ways; if the sensor clearly disagrees with the picture, stop using it for a few seconds (no flip-flopping).
+  const tnow = performance.now(), free = attempt(null), withUp = up ? attempt(up) : null;
+  const agree = withUp && !withUp.fail && !free.fail && withUp.sol.err <= free.sol.err * 1.5 + 1.5;
+  if (withUp && !free.fail && !agree) sensorOffUntil = tnow + 3000;
+  let r, tiltUse;
+  if (withUp && !withUp.fail && tnow >= sensorOffUntil && (agree || free.fail)) { r = withUp; tiltUse = 'on'; }
+  else { r = free; tiltUse = up ? 'ignored (picture or screen?)' : 'off'; }
   if (r.fail) { poseState = null; lastReject = r.fail; return null; }
   const sol = r.sol;
+  cHist.push(sol.C); if (cHist.length > 15) cHist.shift();
+  if (!target) autoB = d.b.slice();
   lastReject = null;
   poseState = sol;
   const three = PyramidSolver.threePose(sol), dist = Math.hypot(sol.C[0], sol.C[2]);
@@ -413,9 +427,10 @@ function drawRing(ps, w, h) {
   if (r3.occH !== H + ':' + cut) setOccluder(H, cut);
   const t = performance.now() / 1000;
   // ring rides up and down the pyramid, hugging it: radius = corner distance at that height + margin
-  const y = H * (0.18 + 0.32 * (0.5 + 0.5 * Math.sin(t * 0.6)));
+  const anim = $('anim').checked;      // off: the ring stays put, so any movement you see is tracking, not animation
+  const y = anim ? H * (0.18 + 0.32 * (0.5 + 0.5 * Math.sin(t * 0.6))) : H * 0.34;
   const rad = 0.7071 * (1 - y / H) * 1.18 + 0.03;
-  r3.ring.position.set(0, y, 0); r3.ring.scale.setScalar(rad); r3.ring.rotation.set(Math.PI / 2 + 0.12 * Math.sin(t * 0.9), 0, t * 0.8);
+  r3.ring.position.set(0, y, 0); r3.ring.scale.setScalar(rad); r3.ring.rotation.set(Math.PI / 2 + (anim ? 0.12 * Math.sin(t * 0.9) : 0), 0, t * 0.8);
   const y2 = H * 0.12, rad2 = 0.7071 * (1 - y2 / H) * 1.3;
   r3.ring2.position.set(0, y2, 0); r3.ring2.scale.setScalar(rad2); r3.ring2.rotation.set(Math.PI / 2, 0, 0);
   const a = t * 1.4; r3.orb.position.set(Math.cos(a) * rad2, y2, Math.sin(a) * rad2);
@@ -536,7 +551,7 @@ async function runStill(img) {
 function renderStill(glide = false) {
   if (!still || !stillRes) return;
   const img = still, w = img.naturalWidth, h = img.naturalHeight, from = glide ? shownSol : null, t0 = performance.now();
-  prev = null; poseState = null; switched = false;
+  prev = null; poseState = null; switched = false; cHist = [];
   const ds = pickTarget(stillRes.dets.slice()); lastDets = ds.length ? ds : stillRes.dets;
   if (target && target.size) $('pyr').value = target.size;
   const ps = solvePose(ds, w, h, false); report(stillRes.dets, stillRes.ms, ps); updateSwitch(lastDets);
@@ -552,7 +567,7 @@ function renderStill(glide = false) {
 }
 
 function loopMedia(el, isLive) {
-  mediaEl = el; const token = {}; running = token; prev = null; times = []; still = null; stillRes = null; poseState = null; target = null; lastDets = [];
+  mediaEl = el; const token = {}; running = token; prev = null; cHist = []; autoB = null; sensorOffUntil = 0; times = []; still = null; stillRes = null; poseState = null; target = null; lastDets = [];
   let last = { dets: [], ps: null }, hits = 0, misses = 0, confirmed = false;
   let vt = -1, prevSmall = null, prevT = 0, lastEst = 0, lastQ = null, trans = null; stab.reset(); cal = PyramidSolver.makeDelayCalibrator();
   const eis = { Q: null, t: 0 };
@@ -627,7 +642,7 @@ function loopMedia(el, isLive) {
           if (ps) { hits++; misses = 0; } else { misses++; hits = 0; }
           if (!$('gate').checked) confirmed = !!ps;
           else if (!confirmed && hits >= (target ? 1 : CONFIRM)) confirmed = true;
-          else if (confirmed && misses >= (qSnap && stab.ready ? RELEASE_STEADY : RELEASE)) { confirmed = false; stab.reset(); }
+          else if (confirmed && misses >= (qSnap && stab.ready ? RELEASE_STEADY : RELEASE)) { confirmed = false; stab.reset(); cHist = []; autoB = null; }
           const show = confirmed ? (ps || last.ps) : null;          // brief misses keep the last good pose
           last = { dets: lastDets, ps: show };
           report(r.dets, r.ms, show, !confirmed && hits > 0 ? hits : 0); }).catch(e => msg('Model error: ' + e.message)).finally(() => busy = false); }
