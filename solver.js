@@ -310,10 +310,11 @@
   }
   // Finds the delay between the motion sensor and the camera picture by lining up picture motion with gyro motion.
   function makeDelayCalibrator() {
-    const obs = []; let lag = null, info = {};
+    const obs = []; let lag = null, info = {}, fScale = null; const ests = [];
     return {
       get info() { return info; },
-      add(ta, tb, sh) { if (sh.edge || sh.quality < 0.25) return; obs.push({ ta, tb, m: [sh.dx, sh.dy] }); while (obs.length && obs[0].tb < tb - 4000) obs.shift(); },
+      get fScale() { return fScale; },                                  // true focal length / assumed (from the FOV setting)
+      add(ta, tb, sh) { if (sh.edge || sh.quality < 0.25) return; obs.push({ ta, tb, m: [sh.dx, sh.dy] }); while (obs.length && obs[0].tb < tb - 6000) obs.shift(); },
       get lag() { return lag; },
       estimate(hist, screenAngle, fSmall) {
         info = { n: obs.length };
@@ -321,23 +322,38 @@
         const energy = obs.reduce((s, o) => s + o.m[0] ** 2 + o.m[1] ** 2, 0) / obs.length;
         info.energy = +energy.toFixed(3);
         if (energy < 0.15) return lag;                                  // phone too still to tell
-        let bestL = null, bestR = Infinity;
-        for (let L = 0; L <= 250; L += 5) {
+        let bestL = null, bestR = Infinity; const curve = [];
+        for (let L = 0; L <= 250; L += 2.5) {
           const P = obs.map(o => { const D = turnBetween(hist.at(o.tb - L), hist.at(o.ta - L), screenAngle); return [D[2] / D[8], D[5] / D[8]]; });
           let mp = 0, pp = 0; obs.forEach((o, i) => { mp += o.m[0] * P[i][0] + o.m[1] * P[i][1]; pp += P[i][0] ** 2 + P[i][1] ** 2; });
           const sc = pp > 0 ? mp / pp : 0;                              // fitted focal length (so a wrong FOV setting doesn't matter)
-          if (sc < fSmall * 0.5 || sc > fSmall * 2) continue;
+          if (sc < fSmall * 0.5 || sc > fSmall * 2) { curve.push(Infinity); continue; }
           const r = obs.reduce((s, o, i) => s + (o.m[0] - sc * P[i][0]) ** 2 + (o.m[1] - sc * P[i][1]) ** 2, 0) / obs.length;
-          if (r < bestR) { bestR = r; bestL = L; }
+          curve.push(r);
+          if (r < bestR) { bestR = r; bestL = L; info.sc = sc; }
         }
         Object.assign(info, { bestL, ratio: bestL === null ? null : +(bestR / energy).toFixed(3) });
         if (bestL === null || bestR > 0.5 * energy) return lag;
-        lag = lag === null ? bestL : 0.7 * lag + 0.3 * bestL;
+        const bi = Math.round(bestL / 2.5), [a, b, c] = [curve[bi - 1], curve[bi], curve[bi + 1]];   // sub-step refinement
+        if (isFinite(a) && isFinite(c) && a - 2 * b + c > 0) bestL += 2.5 * 0.5 * (a - c) / (a - 2 * b + c);
+        ests.push(bestL); if (ests.length > 9) ests.shift();
+        lag = ests.slice().sort((x, y) => x - y)[ests.length >> 1];                // median of recent estimates
+        const fs = info.sc / fSmall; fScale = fScale === null ? fs : 0.8 * fScale + 0.2 * fs;
         return lag;
       },
     };
   }
 
-  const api = { solve, plausible, GATE, makeStabilizer, makeOrientationHistory, imageShift, makeDelayCalibrator, deviceQ, camFromDevice, turnBetween, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
+  // rotation part-way from A to B (a = 0..1)
+  function blendRot(A, B, a) { return mm(A, rodrigues(logmap(mm(tr3(A), B)).map(v => v * a))); }
+  // pose part-way between two poses (used for the ring gliding from one pyramid to another)
+  function blendSol(s0, s1, a) { const R = blendRot(s0.R, s1.R, a), C = s0.C.map((v, i) => v + (s1.C[i] - v) * a); return solFrom(R, C, s1); }
+  // The picture-stabilization offset: how to move/rotate the drawn frame so it looks as if the camera followed the smooth path.
+  function stabilizeOffset(Qsmooth, Qnow, screenAngle, f) {
+    const D = turnBetween(Qsmooth, Qnow, screenAngle);                 // x_smooth = D x_now
+    return { dx: f * D[2] / D[8], dy: f * D[5] / D[8], roll: Math.atan2(D[3], D[0]) };
+  }
+
+  const api = { solve, plausible, GATE, makeStabilizer, blendRot, blendSol, stabilizeOffset, makeOrientationHistory, imageShift, makeDelayCalibrator, deviceQ, camFromDevice, turnBetween, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
   if (typeof module !== 'undefined') module.exports = api; else root.PyramidSolver = api;
 })(typeof self !== 'undefined' ? self : this);
