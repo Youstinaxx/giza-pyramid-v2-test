@@ -23,6 +23,8 @@ body { background: var(--bg); color: var(--fg); font: 14px/1.45 var(--display); 
 .wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
 header { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; padding-block: 10px 6px; }
 header .status { grid-column: 1 / -1; grid-row: 2; }
+.load { grid-column: 1 / -1; height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; }
+.load i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
 @media (max-width: 560px) { h1 small { display: none; } }
 h1 { margin: 0; font-size: 18px; letter-spacing: .01em; text-wrap: balance; }
 h1 small { color: var(--muted); font-weight: 500; font-size: 12px; margin-left: 6px; }
@@ -67,6 +69,7 @@ button:disabled { opacity: .45; cursor: default; }
   <header>
     <h1>Pyramid Detector v3 <small>speed test</small></h1>
     <div class="status"><span id="st"><span class="dot"></span>Loading model…</span><span id="perf"></span></div>
+    <div class="load" id="load"><i id="loadfill"></i></div>
     <button class="ghost tiny" id="gear" aria-expanded="false" aria-controls="more">Settings</button>
   </header>
   <main>
@@ -97,7 +100,7 @@ button:disabled { opacity: .45; cursor: default; }
     <div id="more" class="more" hidden>
     <div class="settings">
       <label for="model">Model
-        <select id="model"><option value="small" selected>v3 small (accurate)</option><option value="nano">v3 nano (fast)</option></select></label>
+        <select id="model"><option value="auto" selected>auto: nano first, small when ready</option><option value="small">v3 small (accurate)</option><option value="nano">v3 nano (fast)</option></select></label>
       <label for="backend">Engine
         <select id="backend"><option value="auto" selected>Auto (GPU, else CPU)</option><option value="webgpu">GPU (WebGPU)</option><option value="wasm">CPU (multi-thread)</option></select></label>
     </div>
@@ -113,7 +116,8 @@ button:disabled { opacity: .45; cursor: default; }
       <label for="gate"><input id="gate" type="checkbox" checked> Triangle filter</label>
       <label for="steadycam"><input id="steadycam" type="checkbox" checked> Steady camera</label>
       <label for="steady"><input id="steady" type="checkbox" checked> Ring follows gyro</label>
-      <label for="anim"><input id="anim" type="checkbox"> Ring animation</label>
+      <label for="anim"><input id="anim" type="checkbox" checked> Ring animation</label>
+      <label for="track"><input id="track" type="checkbox" checked> Follow pyramid every frame</label>
       <label for="delay">Camera delay
         <select id="delay"><option value="auto" selected>auto</option><option value="0">0 ms</option><option value="40">40 ms</option><option value="80">80 ms</option><option value="120">120 ms</option><option value="160">160 ms</option><option value="200">200 ms</option></select></label>
       <button class="ghost" id="copy" style="padding:6px 10px">Copy pose JSON</button>
@@ -143,34 +147,74 @@ const thr = () => parseFloat($('thr').value);
 $('thr').oninput = () => { $('thrv').textContent = thr().toFixed(2); if (still) runStill(still); };
 
 const MODELS = { nano: ['models/nano.onnx'], small: ['models/small.part0', 'models/small.part1'] };
-async function fetchModel(name) {
-  const parts = []; let got = 0;
-  for (const [i, url] of MODELS[name].entries()) {
-    const res = await fetch(url); if (!res.ok) throw new Error('model download failed (' + res.status + ')');
-    const reader = res.body.getReader();
-    for (;;) { const { done, value } = await reader.read(); if (done) break; parts.push(value); got += value.length;
-      status(`Downloading ${name} model ${(got / 1e6).toFixed(0)} MB`); }
+const ENGINE = 'ort/ort-wasm-simd-threaded.jsep.wasm';
+// Files are kept in the browser's storage, so a second visit doesn't download them again. A quick check against the
+// server (its version tag) makes sure an updated model on GitHub is picked up.
+const prog = {};   // url -> [bytes received, total]
+function showProgress(label) {
+  let got = 0, tot = 0; for (const [g, t] of Object.values(prog)) { got += g; tot += Math.max(g, t); }
+  const pct = tot ? Math.min(100, got / tot * 100) : 0; $('loadfill').style.width = pct + '%'; $('load').hidden = pct >= 100;
+  if (label) status(`${label} · ${(got / 1e6).toFixed(0)} / ${(tot / 1e6).toFixed(0)} MB (${pct.toFixed(0)}%)`);
+}
+async function getFile(url, label) {
+  let cache = null; try { cache = await caches.open('giza-files'); } catch (e) {}
+  const hit = cache && await cache.match(url);
+  if (hit) {
+    let same = true;
+    try { const h = await fetch(url, { method: 'HEAD', cache: 'no-store' }); const v = h.headers.get('etag') || h.headers.get('last-modified'); same = !v || v === hit.headers.get('x-version'); } catch (e) {}
+    if (same) { const b = new Uint8Array(await hit.arrayBuffer()); prog[url] = [b.length, b.length]; showProgress(label); return b; }
   }
-  const buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; } return buf;
+  const res = await fetch(url, { cache: 'no-cache' }); if (!res.ok) throw new Error(url + ' download failed (' + res.status + ')');
+  const total = +res.headers.get('content-length') || 0, parts = [], reader = res.body.getReader(); let got = 0;
+  prog[url] = [0, total];
+  for (;;) { const { done, value } = await reader.read(); if (done) break; parts.push(value); got += value.length; prog[url] = [got, Math.max(total, got)]; showProgress(label); }
+  const buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
+  if (cache) try { await cache.put(url, new Response(buf, { headers: { 'x-version': res.headers.get('etag') || res.headers.get('last-modified') || '' } })); } catch (e) {}
+  return buf;
+}
+const engineP = getFile(ENGINE, 'Downloading');   // start the engine download right away, alongside the model
+async function fetchModel(name, label = 'Downloading') {
+  const parts = await Promise.all(MODELS[name].map(u => getFile(u, label)));
+  const n = parts.reduce((a, p) => a + p.length, 0), buf = new Uint8Array(n); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; } return buf;
 }
 const modelCache = {};
-async function loadModel() {
-  const name = $('model').value, want = $('backend').value;
-  session = null; times = [];
-  ort.env.wasm.wasmPaths = new URL('ort/', location.href).href;
-  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
-  const buf = modelCache[name] || (modelCache[name] = await fetchModel(name));
-  status('Starting engine…');
-  let used = 'CPU';
+let loadToken = 0, sessionName = '';
+async function makeSession(name, want, label = 'Downloading') {
+  const buf = modelCache[name] || (modelCache[name] = await fetchModel(name, label));
+  if (!ort.env.wasm.wasmBinary) ort.env.wasm.wasmBinary = (await engineP).buffer;
+  if (label) status('Starting engine…');
+  let s = null, used = 'CPU';
   if (want !== 'wasm' && navigator.gpu) {
-    try { session = await ort.InferenceSession.create(buf, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' }); used = 'GPU'; }
+    try { s = await ort.InferenceSession.create(buf, { executionProviders: ['webgpu'], graphOptimizationLevel: 'all' }); used = 'GPU'; }
     catch (e) { console.warn('WebGPU failed, using CPU', e); }
   }
-  if (!session) session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
-  const note = want === 'webgpu' && used !== 'GPU' ? ' (GPU not available here)' : '';
-  status(`${name} · ${used === 'GPU' ? 'GPU' : 'CPU ' + ort.env.wasm.numThreads + ' thread' + (ort.env.wasm.numThreads > 1 ? 's' : '')}${note}`, 'ok');
+  if (!s) s = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
+  return { s, used };
 }
-for (const id of ['model', 'backend']) $(id).onchange = () => loadModel().then(() => { if (still) runStill(still); }).catch(e => { status('Model failed to load', 'bad'); msg(e.message); });
+function engineLabel(name, used, want, extra = '') {
+  const note = want === 'webgpu' && used !== 'GPU' ? ' (GPU not available here)' : '';
+  return `${name} · ${used === 'GPU' ? 'GPU' : 'CPU ' + ort.env.wasm.numThreads + ' thread' + (ort.env.wasm.numThreads > 1 ? 's' : '')}${note}${extra}`;
+}
+async function loadModel() {
+  const pick = $('model').value, want = $('backend').value, token = ++loadToken;
+  ort.env.wasm.wasmPaths = new URL('ort/', location.href).href;
+  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+  const first = pick === 'auto' ? 'nano' : pick;
+  if (sessionName !== first + want) {
+    session = null; times = [];
+    const { s, used } = await makeSession(first, want); if (token !== loadToken) return;
+    session = s; sessionName = first + want; times = [];
+    status(engineLabel(first, used, want, pick === 'auto' ? ' · getting small…' : ''), 'ok');
+  }
+  showProgress();
+  if (pick === 'auto') {      // the camera already works with nano; swap in small (more accurate) once it's ready
+    makeSession('small', want, null).then(({ s, used }) => {
+      if (token !== loadToken || $('model').value !== 'auto') return;
+      session = s; sessionName = 'small' + want; times = []; status(engineLabel('small', used, want, ' (auto)'), 'ok'); showProgress();
+    }).catch(e => console.warn('small model not loaded', e));
+  }
+}
+for (const id of ['model', 'backend']) $(id).onchange = () => { sessionName = ''; loadModel().then(() => { if (still) runStill(still); }).catch(e => { status('Model failed to load', 'bad'); msg(e.message); }); };
 
 async function detect(src, w, h) {
   if (!session) return { dets: [], ms: 0 };
@@ -329,7 +373,21 @@ let cal = PyramidSolver.makeDelayCalibrator(), gyroSeen = -1e9;
 const gyroLive = () => performance.now() - gyroSeen < 500 && ohist.size > 5;
 const screenAngle = () => (tilt && tilt.angle) || 0;
 const delayMs = () => $('delay').value === 'auto' ? (cal.lag ?? 60) : +$('delay').value;
-const ZOOM = 1.12;   // steady camera crops a little, like the phone's own video stabilization
+const ZOOM = 1.12;
+// frame-by-frame tracking: small grey copies of each camera frame, and the tracker that follows the pyramid in them
+const tracker = PyramidSolver.makePatchTracker(), TG = document.createElement('canvas'), tgx = TG.getContext('2d', { willReadFrequently: true });
+function halfGrey(f) {                 // half-size copy (for the delay measurement), no extra read from the camera
+  const w = f.w >> 1, h = f.h >> 1, g = new Uint8Array(w * h), s = f.g, W = f.w;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = 2 * y * W + 2 * x; g[y * w + x] = (s[i] + s[i + 1] + s[i + W] + s[i + W + 1]) >> 2; }
+  return { g, w, h, k: f.k / 2 };
+}
+function trackGrey(src, w, h) {
+  const k = 224 / Math.max(w, h), sw = Math.round(w * k), sh = Math.round(h * k);
+  if (TG.width !== sw || TG.height !== sh) { TG.width = sw; TG.height = sh; }
+  tgx.drawImage(src, 0, 0, sw, sh); const d = tgx.getImageData(0, 0, sw, sh).data, g = new Uint8Array(sw * sh);
+  for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+  return { g, w: sw, h: sh, k };
+}   // steady camera crops a little, like the phone's own video stabilization
 const SM = document.createElement('canvas'), smx = SM.getContext('2d', { willReadFrequently: true });
 function smallGrey(el, w, h) {           // ~96 px copy of the frame, for measuring how the picture moved
   const k = 96 / Math.max(w, h), sw = Math.max(8, Math.round(w * k)), sh = Math.max(8, Math.round(h * k));
@@ -569,8 +627,8 @@ function renderStill(glide = false) {
 function loopMedia(el, isLive) {
   mediaEl = el; const token = {}; running = token; prev = null; cHist = []; autoB = null; sensorOffUntil = 0; times = []; still = null; stillRes = null; poseState = null; target = null; lastDets = [];
   let last = { dets: [], ps: null }, hits = 0, misses = 0, confirmed = false;
-  let vt = -1, prevSmall = null, prevT = 0, lastEst = 0, lastQ = null, trans = null; stab.reset(); cal = PyramidSolver.makeDelayCalibrator();
-  const eis = { Q: null, t: 0 };
+  let vt = -1, prevSmall = null, prevT = 0, lastEst = 0, lastQ = null, trans = null, vtTrack = -1, base = null, off = [0, 0], lastSnapG = null; tracker.reset(); stab.reset(); cal = PyramidSolver.makeDelayCalibrator();
+  const eis = { Q: null, t: 0 }, FR = document.createElement('canvas'), frx = FR.getContext('2d'); let frameId = null;
   // exact time each camera frame arrived (better than "when the screen refresh noticed it")
   const vf = { t: null, n: 0 };
   if (el.requestVideoFrameCallback) { const cb = (now, md) => { if (running !== token) return; vf.t = md.presentationTime || now; vf.n++; el.requestVideoFrameCallback(cb); }; el.requestVideoFrameCallback(cb); }
@@ -582,13 +640,23 @@ function loopMedia(el, isLive) {
     if (w && h) {
       const steady = steadyOn();
       const fid = vf.t !== null ? vf.n : el.currentTime, ft = vf.t !== null ? vf.t : now;   // which frame is showing, and when it arrived
-      if (steady && fid !== vt) {                                 // new camera frame: measure picture motion for the delay calibration
-        vt = fid; const sm = smallGrey(el, w, h);
+      const tracking = $('track').checked;
+      // grab each new camera frame once, so timing, tracking and drawing all use the very same picture
+      if (fid !== frameId || FR.width !== w || FR.height !== h) { if (FR.width !== w || FR.height !== h) { FR.width = w; FR.height = h; } frx.drawImage(el, 0, 0, w, h); frameId = fid; }
+      // one small grey copy per new camera frame, shared by tracking and the delay measurement (each copy slows the pipeline)
+      const fg = fid !== vt && (steady || (tracking && tracker.ready)) ? trackGrey(FR, w, h) : null;
+      if (fg && steady) {                                         // new camera frame: measure picture motion for the delay calibration
+        vt = fid; const sm = halfGrey(fg);
         if (prevSmall && prevSmall.g.length === sm.g.length) cal.add(prevT, ft, PyramidSolver.imageShift(prevSmall.g, sm.g, sm.w, sm.h, 6));
         prevSmall = sm; prevT = ft;
         if (now - lastEst > 1000) { lastEst = now; cal.estimate(ohist, screenAngle(), camFor(w, h).f * sm.k); }
       }
       const Qnow = gyroLive() ? ohist.at(ft - delayMs()) : null;   // how the phone was turned when the frame on screen was taken
+      if (fg) vt = fid;
+      if (fg && tracking && tracker.ready && fid !== vtTrack) {  // follow the pyramid in this new frame
+        vtTrack = fid; const r = tracker.track(fg.g, fg.w, fg.h);
+        if (r) off = [r.dx / fg.k, r.dy / fg.k];
+      }
       // tapped another pyramid: solve it at once from the last detection and glide the ring over
       if (switched) {
         switched = false;
@@ -596,12 +664,17 @@ function loopMedia(el, isLive) {
         if (trans) trans.from.measure(shownSol, Qnow, screenAngle());
         poseState = null; prev = null; stab.reset();
         const ps = solvePose(pickTarget(lastDets.slice()), w, h, isLive);
-        if (ps) { if (steady && lastQ) stab.measure(ps.sol, lastQ, screenAngle()); confirmed = true; hits = CONFIRM; misses = 0; }
-        else { confirmed = false; hits = 0; }
+        if (ps) { if (steady && lastQ) stab.measure(ps.sol, lastQ, screenAngle()); confirmed = true; hits = CONFIRM; misses = 0;
+          const d0 = pickTarget(lastDets.slice())[0];
+          if (lastSnapG && d0) { tracker.setRef(lastSnapG.g, lastSnapG.w, lastSnapG.h, d0.b.map(v => v * lastSnapG.k)); base = ps; off = [0, 0]; vtTrack = -1; } else { tracker.reset(); base = null; } }
+        else { confirmed = false; hits = 0; tracker.reset(); base = null; }
         last.ps = ps; report(lastDets, times.length ? times[times.length - 1] : 0, ps);
       }
       let drawPs = last.ps;
-      if (steady && last.ps && stab.ready) drawPs = { sol: stab.current(Qnow, screenAngle()), cam: last.ps.cam };
+      if (tracking && last.ps && base && tracker.ready) {         // stuck to the pyramid: the detection's pose, moved with the tracked patch
+        const a = PyramidSolver.project(base.sol.p, [0, base.sol.H, 0], base.cam);
+        drawPs = { sol: PyramidSolver.shiftSol(base.sol, base.cam, a.u, a.v, off[0], off[1]), cam: base.cam };
+      } else if (steady && last.ps && stab.ready) drawPs = { sol: stab.current(Qnow, screenAngle()), cam: last.ps.cam };
       if (trans) {
         const from = trans.from.current(Qnow, screenAngle());
         if (drawPs) {
@@ -629,20 +702,25 @@ function loopMedia(el, isLive) {
         ctx.translate(w / 2, h / 2); ctx.scale(ZOOM, ZOOM); ctx.rotate(o.roll); ctx.translate(-w / 2 + o.dx, -h / 2 + o.dy);
         viewXform = ctx.getTransform();
       } else { eis.Q = null; viewXform = null; }
-      ctx.drawImage(el, 0, 0, w, h); drawPose(drawPs, w); drawDets(last.dets, w); drawTags(last.dets, w);
-      if (!busy) { busy = true; const snap = document.createElement('canvas'); snap.width = w; snap.height = h; snap.getContext('2d').drawImage(el, 0, 0, w, h);
+      ctx.drawImage(FR, 0, 0, w, h); drawPose(drawPs, w); drawDets(last.dets, w); drawTags(last.dets, w);
+      if (!busy) { busy = true; const snap = document.createElement('canvas'); snap.width = w; snap.height = h; snap.getContext('2d').drawImage(FR, 0, 0, w, h);
         const qSnap = steady ? ohist.at(ft - delayMs()) : null;    // how the phone was turned when this frame was taken
+        const snapG = tracking ? trackGrey(snap, w, h) : null;
         detectUpright(snap, w, h, isLive ? rollFromTilt() : 0).then(r => { if (running !== token) return;
           if (switched) return;                                       // a tap came in while this frame was being read: the next frame handles it
           const picked = pickTarget(r.dets);
           if (target && target.size) $('pyr').value = target.size;
           const ds = qSnap ? picked : smooth(picked, w), ps = solvePose(ds, w, h, isLive);
           if (ps && qSnap) stab.measure(ps.sol, qSnap, screenAngle());
-          lastDets = ds.length ? ds : r.dets; lastQ = qSnap; updateSwitch(lastDets);
+          if (ps && snapG) {                                         // restart tracking from the frame this detection saw
+            base = { sol: ps.sol, cam: ps.cam };                      // the tracker handles motion, so start from the fresh detection
+            tracker.setRef(snapG.g, snapG.w, snapG.h, ds[0].b.map(v => v * snapG.k)); off = [0, 0]; vtTrack = -1;
+          }
+          lastDets = ds.length ? ds : r.dets; lastQ = qSnap; lastSnapG = snapG; updateSwitch(lastDets);
           if (ps) { hits++; misses = 0; } else { misses++; hits = 0; }
           if (!$('gate').checked) confirmed = !!ps;
           else if (!confirmed && hits >= (target ? 1 : CONFIRM)) confirmed = true;
-          else if (confirmed && misses >= (qSnap && stab.ready ? RELEASE_STEADY : RELEASE)) { confirmed = false; stab.reset(); cHist = []; autoB = null; }
+          else if (confirmed && misses >= (qSnap && stab.ready ? RELEASE_STEADY : RELEASE)) { confirmed = false; stab.reset(); cHist = []; autoB = null; tracker.reset(); base = null; }
           const show = confirmed ? (ps || last.ps) : null;          // brief misses keep the last good pose
           last = { dets: lastDets, ps: show };
           report(r.dets, r.ms, show, !confirmed && hits > 0 ? hits : 0); }).catch(e => msg('Model error: ' + e.message)).finally(() => busy = false); }

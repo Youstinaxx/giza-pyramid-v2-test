@@ -358,6 +358,74 @@
     return { dx: f * D[2] / D[8], dy: f * D[5] / D[8], roll: Math.atan2(D[3], D[0]) };
   }
 
+  // ---------- frame-by-frame tracking (like a face filter): follow the pyramid's patch of picture in every frame ----------
+  // Grey frames are small (a few hundred px). setRef() takes the frame a detection was made on and the pyramid's box;
+  // track() finds where that patch is in the newest frame. Brightness changes are ignored (each window compared mean-free).
+  function blur3(g, w, h) {                       // light 3x3 blur so the coarse scan can't skip past the true match
+    const t = new Float32Array(w * h), o = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x; t[i] = (g[i - (x > 0)] + g[i] + g[i + (x < w - 1)]) / 3; }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x; o[i] = (t[i - (y > 0) * w] + t[i] + t[i + (y < h - 1) * w]) / 3; }
+    return o;
+  }
+  function makePatchTracker() {
+    let ref = null;
+    return {
+      reset() { ref = null; },
+      get ready() { return !!(ref && ref.ok); },
+      setRef(g, w, h, box) {
+        g = blur3(g, w, h);
+        const x0 = Math.max(0, Math.round(box[0])), y0 = Math.max(0, Math.round(box[1]));
+        const tw = Math.min(w - x0, Math.round(box[2] - box[0])), th = Math.min(h - y0, Math.round(box[3] - box[1]));
+        if (tw < 8 || th < 8) { ref = null; return; }
+        const step = Math.max(1, Math.round(Math.sqrt(tw * th / 700)));          // ~700 sample points whatever the size
+        const pts = []; let m = 0;
+        for (let y = 0; y < th; y += step) for (let x = 0; x < tw; x += step) { const v = g[(y0 + y) * w + x0 + x]; pts.push(x, y, v); m += v; }
+        m /= pts.length / 3; for (let i = 2; i < pts.length; i += 3) pts[i] -= m;
+        ref = { pts, tw, th, x0, y0, x: x0, y: y0, ok: true, first: true, miss: 0 };
+      },
+      track(g, w, h) {
+        if (!ref || !ref.ok) return null;
+        g = blur3(g, w, h);
+        const n = ref.pts.length / 3;
+        const cost = (ox, oy) => {                                   // mean-free difference between template and window
+          if (ox < 0 || oy < 0 || ox + ref.tw > w || oy + ref.th > h) return Infinity;
+          let m = 0; for (let i = 0; i < ref.pts.length; i += 3) m += g[(oy + ref.pts[i + 1]) * w + ox + ref.pts[i]]; m /= n;
+          let e = 0; for (let i = 0; i < ref.pts.length; i += 3) e += Math.abs(g[(oy + ref.pts[i + 1]) * w + ox + ref.pts[i]] - m - ref.pts[i + 2]);
+          return e / n;
+        };
+        // coarse scan (every 2nd position, wide right after a new detection), then a fine scan around the best
+        const R = ref.first ? 30 : 14, cx = Math.round(ref.x + (ref.vx || 0)), cy = Math.round(ref.y + (ref.vy || 0));
+        ref.first = false;
+        let best = Infinity, bx = 0, by = 0, sum = 0, cnt = 0;
+        for (let dy = -R; dy <= R; dy += 2) for (let dx = -R; dx <= R; dx += 2) {
+          const e = cost(cx + dx, cy + dy); if (!isFinite(e)) continue; sum += e; cnt++; if (e < best) { best = e; bx = dx; by = dy; }
+        }
+        if (!cnt) { ref.ok = false; return null; }
+        const fine = {}; let fb = best, fx0 = bx, fy0 = by;
+        for (let dy = by - 2; dy <= by + 2; dy++) for (let dx = bx - 2; dx <= bx + 2; dx++) {
+          const e = cost(cx + dx, cy + dy); fine[dx + ',' + dy] = e; if (e < fb) { fb = e; fx0 = dx; fy0 = dy; }
+        }
+        const at = (dx, dy) => fine[dx + ',' + dy] ?? cost(cx + dx, cy + dy);
+        const sub = (a, b, c) => { const d = a - 2 * b + c; return isFinite(d) && d > 1e-9 ? 0.5 * (a - c) / d : 0; };
+        const fx = sub(at(fx0 - 1, fy0), fb, at(fx0 + 1, fy0)), fy = sub(at(fx0, fy0 - 1), fb, at(fx0, fy0 + 1));
+        const quality = 1 - fb / (sum / cnt), edge = Math.abs(fx0) >= R || Math.abs(fy0) >= R;
+        if (quality < 0.2 || edge) { if (++ref.miss > 3) ref.ok = false; return null; }
+        const nx = cx + fx0 + Math.max(-0.5, Math.min(0.5, fx)), ny = cy + fy0 + Math.max(-0.5, Math.min(0.5, fy));
+        ref.vx = 0.5 * (nx - ref.x); ref.vy = 0.5 * (ny - ref.y);   // expect part of the same motion next frame
+        ref.miss = 0; ref.x = nx; ref.y = ny;
+        return { dx: ref.x - ref.x0, dy: ref.y - ref.y0, quality };
+      },
+    };
+  }
+  // Turn a pose so that one picture point (e.g. the tip) moves by (dx, dy) pixels: the ring follows the tracked pyramid.
+  function shiftSol(sol, cam, u, v, dx, dy) {
+    const ray = (x, y) => norm([(x - cam.cx) / cam.f, (y - cam.cy) / cam.f, 1]);
+    const a = ray(u, v), b = ray(u + dx, v + dy), ax = cross(a, b), s = Math.hypot(...ax), c = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    if (s < 1e-12) return sol;
+    const Rab = rodrigues(ax.map(x => x / s * Math.atan2(s, c)));
+    return solFrom(mm(Rab, sol.R), sol.C, sol);
+  }
+
   // A pose found in a picture turned by `roll` (radians, clockwise on screen) about its centre -> the same pose in the
   // original picture. Turning a picture about its centre is the same as turning the camera about its viewing axis.
   function rollSol(sol, roll) {
@@ -365,6 +433,6 @@
     const c = Math.cos(roll), s = Math.sin(roll), Z = [c, -s, 0, s, c, 0, 0, 0, 1];
     return solFrom(mm(Z, sol.R), sol.C, sol);
   }
-  const api = { solve, plausible, GATE, makeStabilizer, rollSol, blendRot, blendSol, stabilizeOffset, makeOrientationHistory, imageShift, makeDelayCalibrator, deviceQ, camFromDevice, turnBetween, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
+  const api = { solve, plausible, GATE, makeStabilizer, rollSol, makePatchTracker, shiftSol, blendRot, blendSol, stabilizeOffset, makeOrientationHistory, imageShift, makeDelayCalibrator, deviceQ, camFromDevice, turnBetween, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
   if (typeof module !== 'undefined') module.exports = api; else root.PyramidSolver = api;
 })(typeof self !== 'undefined' ? self : this);
