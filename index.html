@@ -34,6 +34,14 @@ main { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px;
 .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
 .stage .msg { position: absolute; inset: auto 12px 12px 12px; font: 12px var(--mono); color: var(--fg); background: rgba(18,16,13,.82); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
 .pose { position: absolute; top: 44px; left: 10px; right: 10px; font: 500 12px var(--mono); background: rgba(18,16,13,.8); padding: 6px 8px; border-radius: 6px; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+.readout.rej { color: #ff9b7a; }
+.switch { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); display: flex; align-items: center; gap: 2px; padding: 3px; background: rgba(18,16,13,.82); border: 1px solid var(--line); border-radius: 999px; font: 600 12px var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.switch button { background: transparent; color: var(--fg); padding: 5px 10px; border-radius: 999px; font: 600 14px var(--mono); line-height: 1; }
+.switch .which { padding: 0 4px; color: var(--accent); }
+.switch select { font: 600 12px var(--mono); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 3px 6px; }
+.switch .auto { font-size: 11px; color: var(--muted); padding: 5px 8px; }
+.stage.multi .msg { bottom: 52px; }
+.stage canvas { touch-action: manipulation; cursor: pointer; }
 .readout { position: absolute; top: 10px; left: 10px; font: 500 12px var(--mono); background: rgba(18,16,13,.78); padding: 6px 8px; border-radius: 6px; font-variant-numeric: tabular-nums; }
 .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .modes .mode { background: transparent; color: var(--muted); border-radius: 0; padding: 10px 6px; font-size: 13px; border-left: 1px solid var(--line); }
@@ -57,7 +65,7 @@ button:disabled { opacity: .45; cursor: default; }
 
 <div class="wrap" style="flex:1;display:flex;flex-direction:column;min-height:0">
   <header>
-    <h1>Pyramid Detector v2 <small>speed test</small></h1>
+    <h1>Pyramid Detector v3 <small>speed test</small></h1>
     <div class="status"><span id="st"><span class="dot"></span>Loading model…</span><span id="perf"></span></div>
     <button class="ghost tiny" id="gear" aria-expanded="false" aria-controls="more">Settings</button>
   </header>
@@ -67,6 +75,13 @@ button:disabled { opacity: .45; cursor: default; }
       <div class="readout" id="readout">—</div>
       <div class="pose" id="pose" hidden></div>
       <div class="msg" id="msg" hidden></div>
+      <div class="switch" id="switch" hidden role="group" aria-label="Choose pyramid">
+        <button id="prevP" aria-label="Previous pyramid">‹</button>
+        <span class="which" id="which">1/3</span>
+        <select id="sizeP" aria-label="Which pyramid is this"><option value="khufu">Khufu</option><option value="khafre">Khafre</option><option value="menkaure">Menkaure</option></select>
+        <button id="nextP" aria-label="Next pyramid">›</button>
+        <button class="auto" id="autoP" hidden>auto</button>
+      </div>
     </div>
     <div class="modes" role="group" aria-label="View mode">
       <button class="mode" data-mode="det" aria-pressed="false">Detection</button>
@@ -82,7 +97,7 @@ button:disabled { opacity: .45; cursor: default; }
     <div id="more" class="more" hidden>
     <div class="settings">
       <label for="model">Model
-        <select id="model"><option value="small" selected>v2 small (accurate)</option><option value="nano">v2 nano (fast)</option></select></label>
+        <select id="model"><option value="small" selected>v3 small (accurate)</option><option value="nano">v3 nano (fast)</option></select></label>
       <label for="backend">Engine
         <select id="backend"><option value="auto" selected>Auto (GPU, else CPU)</option><option value="webgpu">GPU (WebGPU)</option><option value="wasm">CPU (multi-thread)</option></select></label>
     </div>
@@ -95,6 +110,10 @@ button:disabled { opacity: .45; cursor: default; }
         <select id="pyr"><option value="khufu" selected>Khufu (230 m)</option><option value="khafre">Khafre (215 m)</option><option value="menkaure">Menkaure (103 m)</option></select></label>
       <label for="step">Grid
         <select id="step"><option value="5" selected>every 5%</option><option value="10">every 10%</option><option value="20">every 20%</option></select></label>
+      <label for="gate"><input id="gate" type="checkbox" checked> Triangle filter</label>
+      <label for="steady"><input id="steady" type="checkbox" checked> Steady ring (gyro)</label>
+      <label for="delay">Camera delay
+        <select id="delay"><option value="auto" selected>auto</option><option value="0">0 ms</option><option value="40">40 ms</option><option value="80">80 ms</option><option value="120">120 ms</option><option value="160">160 ms</option><option value="200">200 ms</option></select></label>
       <button class="ghost" id="copy" style="padding:6px 10px">Copy pose JSON</button>
       <button class="ghost" id="stop" style="padding:6px 10px">Stop</button>
     </div>
@@ -185,30 +204,126 @@ function smooth(dets, w) {
   prev = JSON.parse(JSON.stringify(m)); return dets;
 }
 
+// ---- choosing one pyramid when several are in view ----
+// target = the pyramid the user picked; it is followed frame to frame by position, so the ring stays on it.
+let target = null, lastDets = [], switched = false;
+const centre = b => [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+function matchCost(a, b) {            // 0 = same box; ~1 = moved a full box width, or very different size
+  const [ax, ay] = centre(a), [bx, by] = centre(b), bw = Math.max(1, b[2] - b[0]), bh = Math.max(1, b[3] - b[1]);
+  const area = x => Math.max(1, (x[2] - x[0]) * (x[3] - x[1]));
+  return Math.hypot((ax - bx) / bw, (ay - by) / bh) + 0.5 * Math.abs(Math.log(area(a) / area(b)));
+}
+const leftToRight = dets => dets.map((d, i) => i).sort((i, j) => centre(dets[i].b)[0] - centre(dets[j].b)[0]);
+// Put the chosen pyramid first (the one that drives the pose). Returns [] when the chosen one is out of view.
+function pickTarget(dets) {
+  if (!target) return dets;
+  let best = -1, bc = Infinity;
+  dets.forEach((d, i) => { const c = matchCost(d.b, target.b); if (c < bc) { bc = c; best = i; } });
+  if (best >= 0 && bc < 0.7) { target.b = dets[best].b.slice(); target.lost = 0; return [dets[best], ...dets.filter((_, i) => i !== best)]; }
+  if (++target.lost > 12) { target = null; updateSwitch(dets); return dets; }   // gone for good (~1-2 s): back to automatic
+  return [];
+}
+function choose(d) {
+  target = d ? { b: d.b.slice(), lost: 0, size: (target && matchCost(d.b, target.b) < 0.7 ? target.size : null) || guessSize(d) } : null;
+  if (target) $('pyr').value = target.size;
+  poseState = null; prev = null; switched = true;
+  if (still) renderStill(); else updateSwitch(lastDets);
+}
+function guessSize(d) {   // Menkaure looks much smaller than its neighbours; otherwise keep the current setting
+  if (lastDets.length >= 2) {
+    const hgt = x => x.b[3] - x.k[0][1], big = Math.max(...lastDets.map(hgt));
+    if (hgt(d) < 0.55 * big) return 'menkaure';
+  }
+  return $('pyr').value === 'menkaure' ? 'khufu' : $('pyr').value;
+}
+function updateSwitch(dets) {
+  const many = dets.length >= 2 || !!target;
+  $('switch').hidden = !many; $('stage').classList.toggle('multi', many);
+  if (!many) return;
+  const order = leftToRight(dets);
+  const cur = target ? order.findIndex(i => matchCost(dets[i].b, target.b) < 0.7) : order.indexOf(0);
+  $('which').textContent = `${cur >= 0 ? cur + 1 : '–'}/${dets.length}`;
+  $('autoP').hidden = !target; $('sizeP').value = $('pyr').value;
+}
+function step(dir) {
+  const dets = lastDets; if (!dets.length) return;
+  const order = leftToRight(dets);
+  const cur = target ? order.findIndex(i => matchCost(dets[i].b, target.b) < 0.7) : order.indexOf(0);
+  choose(dets[order[((cur < 0 ? 0 : cur + dir) % order.length + order.length) % order.length]]);
+}
+$('prevP').onclick = () => step(-1);
+$('nextP').onclick = () => step(1);
+$('autoP').onclick = () => choose(null);
+$('sizeP').onchange = () => { $('pyr').value = $('sizeP').value; if (target) target.size = $('sizeP').value; poseState = null; if (still) renderStill(); };
+// tap on a pyramid to pick it; tap empty space to go back to automatic
+$('view').addEventListener('click', e => {
+  if (!lastDets.length) return;
+  const r = view.getBoundingClientRect(), sc = Math.min(r.width / view.width, r.height / view.height);
+  const x = (e.clientX - r.left - (r.width - view.width * sc) / 2) / sc, y = (e.clientY - r.top - (r.height - view.height * sc) / 2) / sc;
+  const area = d => (d.b[2] - d.b[0]) * (d.b[3] - d.b[1]);
+  const hit = lastDets.filter(d => x >= d.b[0] && x <= d.b[2] && y >= d.b[1] && y <= d.b[3]).sort((a, b) => area(a) - area(b));
+  if (hit.length) choose(hit[0]);
+  else if (target) choose(null);
+});
+function drawTags(dets, w) {          // numbered markers above each pyramid when there is more than one
+  if (dets.length < 2) return;
+  const sc = Math.min((view.clientWidth || view.width) / view.width, (view.clientHeight || view.height) / view.height);
+  const k = 1 / Math.max(1e-3, sc), R = 11 * k, order = leftToRight(dets);
+  ctx.font = `700 ${Math.round(12 * k)}px IBM Plex Mono, monospace`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  order.forEach((i, n) => {
+    const d = dets[i], sel = i === 0 && (!target || target.lost === 0), x = d.k[0][0], y = Math.max(R + 2, d.k[0][1] - R * 2.2);
+    ctx.beginPath(); ctx.arc(x, y, R, 0, 7); ctx.fillStyle = sel ? '#ffc94a' : 'rgba(18,16,13,.75)'; ctx.fill();
+    ctx.lineWidth = 1.5 * k; ctx.strokeStyle = sel ? '#ffc94a' : 'rgba(255,255,255,.85)'; ctx.stroke();
+    ctx.fillStyle = sel ? '#12100d' : '#fff'; ctx.fillText(String(n + 1), x, y + k);
+  });
+  ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+}
+
 function fitCanvas(w, h) { if (view.width !== w || view.height !== h) { view.width = w; view.height = h; } }
 // ---- 3D pose ----
-let poseState = null, tilt = null, lastPose = null;
+let poseState = null, tilt = null, lastPose = null, lastReject = null;
+const CONFIRM = 3, RELEASE = 4, RELEASE_STEADY = 10;
+// ---- steady ring: the gyroscope moves the ring between detections; the camera-vs-sensor delay is measured automatically ----
+const ohist = PyramidSolver.makeOrientationHistory(), stab = PyramidSolver.makeStabilizer();
+let cal = PyramidSolver.makeDelayCalibrator(), gyroSeen = -1e9;
+const gyroLive = () => performance.now() - gyroSeen < 500 && ohist.size > 5;
+const screenAngle = () => (tilt && tilt.angle) || 0;
+const delayMs = () => $('delay').value === 'auto' ? (cal.lag ?? 60) : +$('delay').value;
+const SM = document.createElement('canvas'), smx = SM.getContext('2d', { willReadFrequently: true });
+function smallGrey(el, w, h) {           // ~96 px copy of the frame, for measuring how the picture moved
+  const k = 96 / Math.max(w, h), sw = Math.max(8, Math.round(w * k)), sh = Math.max(8, Math.round(h * k));
+  if (SM.width !== sw || SM.height !== sh) { SM.width = sw; SM.height = sh; }
+  smx.drawImage(el, 0, 0, sw, sh); const d = smx.getImageData(0, 0, sw, sh).data, g = new Uint8Array(sw * sh);
+  for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+  return { g, w: sw, h: sh, k };
+}   // live/video: show only after 3 agreeing frames; hold through up to 3 missed frames
 const fovDeg = () => parseFloat($('fov').value);
-$('fov').oninput = () => { $('fovv').textContent = fovDeg() + '°'; poseState = null; if (still) runStill(still); };
+$('fov').oninput = () => { $('fovv').textContent = fovDeg() + '°'; poseState = null; if (still) renderStill(); };
 $('gear').onclick = () => { const open = $('more').hidden; $('more').hidden = !open; $('gear').setAttribute('aria-expanded', String(open)); $('gear').textContent = open ? 'Close' : 'Settings'; };
 let mode = 'ring';
 document.querySelectorAll('.mode').forEach(b => b.onclick = () => {
   mode = b.dataset.mode; document.querySelectorAll('.mode').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
-  if (still) runStill(still);
+  if (still) renderStill();
 });
 // real dimensions: base (m), original height to the tip (m), current top (m)
 const PYR = { khufu: { base: 230.33, h: 146.6, top: 138.5 }, khafre: { base: 215.25, h: 143.5, top: 136.4 }, menkaure: { base: 103.4, h: 65.5, top: 61 } };
 const pyr = () => PYR[$('pyr').value];
-for (const id of ['pyr', 'step']) $(id).onchange = () => { poseState = null; if (still) runStill(still); };
+$('steady').onchange = () => stab.reset();
+for (const id of ['pyr', 'step', 'gate']) $(id).onchange = () => { if (id === 'pyr' && target) target.size = $('pyr').value; $('sizeP').value = $('pyr').value; poseState = null; if (still) renderStill(); };
 function camFor(w, h) { return { f: (Math.max(w, h) / 2) / Math.tan(fovDeg() * Math.PI / 360), cx: w / 2, cy: h / 2 }; }
 function solvePose(dets, w, h, useTilt) {
-  if (!dets.length) { poseState = null; return null; }
+  if (!dets.length) { poseState = null; lastReject = null; return null; }
   const d = dets[0], cam = camFor(w, h);
   const up = useTilt && tilt ? PyramidSolver.upFromOrientation(tilt.beta, tilt.gamma, tilt.angle) : null;
   const H = pyr().h / pyr().base;
   let sol = PyramidSolver.solve(d.k, cam, { init: poseState, box: d.b, up, H });
   if (!(sol.p && sol.ok) && poseState) sol = PyramidSolver.solve(d.k, cam, { box: d.b, up, H });
-  if (!(sol.p && sol.ok)) { poseState = null; return null; }
+  if (!(sol.p && sol.ok)) { poseState = null; lastReject = 'shape does not match a pyramid'; return null; }
+  if ($('gate').checked) {   // is it physically a pyramid seen from where a person can stand?
+    const g = PyramidSolver.plausible(sol, d.k, d.b, cam, up);
+    if (!g.ok) { poseState = null; lastReject = g.reason; return null; }
+  }
+  lastReject = null;
   poseState = sol;
   const three = PyramidSolver.threePose(sol), dist = Math.hypot(sol.C[0], sol.C[2]);
   lastPose = { time: Date.now(), units: 'pyramid base = 1', pyramid: $('pyr').value, metres_per_unit: pyr().base, image: { width: w, height: h }, intrinsics: { fx: cam.f, fy: cam.f, cx: cam.cx, cy: cam.cy, fov_long_side_deg: fovDeg() },
@@ -332,7 +447,8 @@ $('copy').onclick = () => {
 function drawDets(dets, w) {
   if (mode !== 'det') return;
   const L = Math.max(2, w / 360);
-  for (const d of dets) {
+  dets.forEach((d, di) => {
+    ctx.globalAlpha = dets.length > 1 && di > 0 ? 0.45 : 1;
     const k = d.k, ok = k.map(p => p[2] > 0.5), P = k.map(p => [p[0], p[1]]);
     ctx.strokeStyle = '#e8b04b'; ctx.lineWidth = L; ctx.strokeRect(d.b[0], d.b[1], d.b[2] - d.b[0], d.b[3] - d.b[1]);
     ctx.strokeStyle = '#ffffff'; ctx.lineWidth = L * 1.2; ctx.beginPath();
@@ -344,36 +460,81 @@ function drawDets(dets, w) {
       if (ok[j]) { ctx.fillStyle = KC[j]; ctx.fill(); } else { ctx.strokeStyle = KC[j]; ctx.lineWidth = L; ctx.stroke(); }
       ctx.fillStyle = KC[j]; ctx.font = `600 ${Math.round(L * 7)}px IBM Plex Mono, monospace`; ctx.fillText(KN[j], p[0] + L * 4, p[1] - L * 3); });
     ctx.fillStyle = '#e8b04b'; ctx.font = `600 ${Math.round(L * 7)}px IBM Plex Mono, monospace`; ctx.fillText(d.s.toFixed(2), d.b[0], Math.max(L * 8, d.b[1] - L * 3));
-  }
+  });
+  ctx.globalAlpha = 1;
 }
-function report(dets, ms) {
+function report(dets, ms, ps, pending) {
   times.push(ms); if (times.length > 20) times.shift();
   const avg = times.reduce((a, b) => a + b, 0) / times.length;
-  $('perf').textContent = `${avg.toFixed(0)} ms/frame · ${(1000 / avg).toFixed(1)} fps model`;
-  $('readout').textContent = dets.length ? `${dets.length} pyramid${dets.length > 1 ? 's' : ''} · score ${dets[0].s.toFixed(2)}` : 'no pyramid';
+  const st = mediaEl && stream && $('steady').checked ? (gyroLive() ? ` · steady: gyro, delay ${Math.round(delayMs())} ms${$('delay').value === 'auto' ? (cal.lag == null ? ' (measuring)' : ' (auto)') : ''}` : ' · steady: no gyro') : '';
+  $('perf').textContent = `${avg.toFixed(0)} ms/frame · ${(1000 / avg).toFixed(1)} fps model${st}`;
+  const txt = !dets.length ? 'no pyramid'
+    : lastReject && !ps ? `not a pyramid · ${lastReject} (score ${dets[0].s.toFixed(2)})`
+    : pending ? `checking… ${pending}/${CONFIRM}`
+    : target && target.lost ? `chosen pyramid out of view · tap another or wait`
+    : dets.length > 1 ? `${dets.length} pyramids · ring on ${$('pyr').value[0].toUpperCase() + $('pyr').value.slice(1)}${target ? '' : ' (auto)'} · tap to switch`
+    : `1 pyramid · score ${dets[0].s.toFixed(2)}`;
+  $('readout').textContent = txt;
+  $('readout').classList.toggle('rej', !!(dets.length && lastReject && !ps));
+  if (!ps) $('pose').hidden = true;
 }
 
 let still = null;
+let stillRes = null;
 async function runStill(img) {
-  stopAll(); still = img; const w = img.naturalWidth, h = img.naturalHeight;
+  stopAll(); still = img; const w = img.naturalWidth, h = img.naturalHeight; target = null;
   fitCanvas(w, h); ctx.drawImage(img, 0, 0);
-  const { dets, ms } = await detect(img, w, h); prev = null; poseState = null; const ps = solvePose(dets, w, h, false); report(dets, ms);
+  stillRes = await detect(img, w, h); renderStill();
+}
+function renderStill() {
+  if (!still || !stillRes) return;
+  const img = still, w = img.naturalWidth, h = img.naturalHeight;
+  prev = null; poseState = null; switched = false;
+  const ds = pickTarget(stillRes.dets.slice()); lastDets = ds.length ? ds : stillRes.dets;
+  if (target && target.size) $('pyr').value = target.size;
+  const ps = solvePose(ds, w, h, false); report(stillRes.dets, stillRes.ms, ps); updateSwitch(lastDets);
   const token = {}; running = token;
-  const paint = () => { if (running !== token || still !== img) return; ctx.drawImage(img, 0, 0); drawPose(ps, w); drawDets(dets, w);
+  const paint = () => { if (running !== token || still !== img) return; ctx.drawImage(img, 0, 0); drawPose(ps, w); drawDets(lastDets, w); drawTags(lastDets, w);
     if (mode === 'ring' && ps) requestAnimationFrame(paint); };
   paint();
 }
 
 function loopMedia(el, isLive) {
-  mediaEl = el; const token = {}; running = token; prev = null; times = []; still = null; poseState = null;
-  let last = { dets: [], ps: null };
+  mediaEl = el; const token = {}; running = token; prev = null; times = []; still = null; stillRes = null; poseState = null; target = null; lastDets = [];
+  let last = { dets: [], ps: null }, hits = 0, misses = 0, confirmed = false;
+  let vt = -1, prevSmall = null, prevT = 0, lastEst = 0; stab.reset(); cal = PyramidSolver.makeDelayCalibrator();
+  const steadyOn = () => isLive && $('steady').checked && gyroLive();
   const frame = async () => {
     if (running !== token) return;
-    const w = el.videoWidth, h = el.videoHeight;
+    const w = el.videoWidth, h = el.videoHeight, now = performance.now();
     if (w && h) {
-      fitCanvas(w, h); ctx.drawImage(el, 0, 0, w, h); drawPose(last.ps, w); drawDets(last.dets, w);
+      const steady = steadyOn();
+      if (steady && el.currentTime !== vt) {                     // new camera frame: measure picture motion for the delay calibration
+        vt = el.currentTime; const sm = smallGrey(el, w, h);
+        if (prevSmall && prevSmall.g.length === sm.g.length) cal.add(prevT, now, PyramidSolver.imageShift(prevSmall.g, sm.g, sm.w, sm.h, 6));
+        prevSmall = sm; prevT = now;
+        if (now - lastEst > 1000) { lastEst = now; cal.estimate(ohist, screenAngle(), camFor(w, h).f * sm.k); }
+      }
+      let drawPs = last.ps;
+      if (steady && last.ps && stab.ready) drawPs = { sol: stab.current(ohist.at(now - delayMs()), screenAngle()), cam: last.ps.cam };
+      window.ringPose = drawPs && drawPs.sol;   // for the AR team / debugging: the pose the ring is drawn with right now
+      fitCanvas(w, h); ctx.drawImage(el, 0, 0, w, h); drawPose(drawPs, w); drawDets(last.dets, w); drawTags(last.dets, w);
       if (!busy) { busy = true; const snap = document.createElement('canvas'); snap.width = w; snap.height = h; snap.getContext('2d').drawImage(el, 0, 0, w, h);
-        detect(snap, w, h).then(r => { if (running === token) { const ds = smooth(r.dets, w); last = { dets: ds, ps: solvePose(ds, w, h, isLive) }; report(r.dets, r.ms); } }).catch(e => msg('Model error: ' + e.message)).finally(() => busy = false); }
+        const qSnap = steady ? ohist.at(now - delayMs()) : null;   // how the phone was turned when this frame was taken
+        detect(snap, w, h).then(r => { if (running !== token) return;
+          if (switched) { switched = false; confirmed = false; hits = CONFIRM - 1; last.ps = null; stab.reset(); }   // new pick: show it on the next good frame
+          const picked = pickTarget(r.dets);
+          if (target && target.size) $('pyr').value = target.size;
+          const ds = qSnap ? picked : smooth(picked, w), ps = solvePose(ds, w, h, isLive);
+          if (ps && qSnap) stab.measure(ps.sol, qSnap, screenAngle());
+          lastDets = ds.length ? ds : r.dets; updateSwitch(lastDets);
+          if (ps) { hits++; misses = 0; } else { misses++; hits = 0; }
+          if (!$('gate').checked) confirmed = !!ps;
+          else if (!confirmed && hits >= CONFIRM) confirmed = true;
+          else if (confirmed && misses >= (qSnap && stab.ready ? RELEASE_STEADY : RELEASE)) { confirmed = false; stab.reset(); }
+          const show = confirmed ? (ps || last.ps) : null;          // brief misses keep the last good pose
+          last = { dets: lastDets, ps: show };
+          report(r.dets, r.ms, show, !confirmed && hits > 0 ? hits : 0); }).catch(e => msg('Model error: ' + e.message)).finally(() => busy = false); }
     }
     if (!isLive && el.ended) { msg('Video finished · pick another or press Live camera'); return; }
     requestAnimationFrame(frame);
@@ -402,7 +563,8 @@ async function openBackCamera() {
   return navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: back.deviceId }, ...size }, audio: false });
 }
 function startTilt() {
-  const on = e => { if (e.beta == null) return; tilt = { beta: e.beta, gamma: e.gamma, angle: (screen.orientation && screen.orientation.angle) || window.orientation || 0 }; };
+  const on = e => { if (e.beta == null) return; tilt = { beta: e.beta, gamma: e.gamma, angle: (screen.orientation && screen.orientation.angle) || window.orientation || 0 };
+    if (e.alpha != null) { ohist.push(performance.now(), PyramidSolver.deviceQ(e.alpha, e.beta, e.gamma)); gyroSeen = performance.now(); } };
   const add = () => window.addEventListener('deviceorientation', on);
   if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function')
     return DeviceOrientationEvent.requestPermission().then(r => { if (r === 'granted') add(); }).catch(() => {});

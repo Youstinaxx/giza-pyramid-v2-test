@@ -202,6 +202,142 @@
     return [d[0], -d[1], -d[2]];                                                        // back camera, OpenCV axes
   }
 
-  const api = { solve, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
+  // Is this detection physically a Giza pyramid seen from where a person can stand?
+  // Rejects generic triangles: wrong slope / proportions (bad fit), impossible camera places, wrong "up".
+  const GATE = { maxRelErr: 0.045, minPoints: 3, minHeight: -0.02, maxHeight: 0.35, minDist: 0.55, maxDist: 25, maxUpDeg: 15, maxUpDegNoSensor: 50 };
+  function plausible(sol, kp, box, cam, up, g = GATE) {
+    if (!sol || !sol.p) return { ok: false, reason: 'no fit' };
+    if (sol.used < g.minPoints) return { ok: false, reason: 'too few corners' };
+    const hpx = Math.max(10, (box ? box[3] : kp[0][1] + 10) - kp[0][1]);
+    const rel = sol.err / hpx;
+    if (rel > g.maxRelErr) return { ok: false, reason: 'shape does not match a pyramid', rel };
+    const C = sol.C, dist = Math.hypot(C[0], C[2]);
+    if (C[1] < g.minHeight || C[1] > g.maxHeight) return { ok: false, reason: 'impossible camera height', rel };
+    if (dist < g.minDist || dist > g.maxDist) return { ok: false, reason: 'impossible distance', rel };
+    const w = mv(sol.R, [0, 1, 0]);                    // pyramid's up axis in camera coords (y down)
+    if (up) {
+      const u = norm(up), ang = Math.acos(Math.max(-1, Math.min(1, w[0] * u[0] + w[1] * u[1] + w[2] * u[2]))) * 180 / Math.PI;
+      if (ang > g.maxUpDeg) return { ok: false, reason: 'not standing upright (tilt sensor)', rel, ang };
+    } else {
+      const ang = Math.acos(Math.max(-1, Math.min(1, -w[1]))) * 180 / Math.PI;   // vs image "up" for photos
+      if (ang > g.maxUpDegNoSensor) return { ok: false, reason: 'not standing upright', rel, ang };
+    }
+    return { ok: true, rel };
+  }
+
+  // ---------- steady ring: gyroscope + smoothing ----------
+  const mm = (A, B) => { const C = new Array(9); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) C[3 * i + j] = A[3 * i] * B[j] + A[3 * i + 1] * B[3 + j] + A[3 * i + 2] * B[6 + j]; return C; };
+  const tr3 = A => [A[0], A[3], A[6], A[1], A[4], A[7], A[2], A[5], A[8]];
+  // phone orientation (deviceorientation alpha/beta/gamma, degrees) -> rotation device -> earth (W3C: Rz(a) Rx(b) Ry(g))
+  function deviceQ(alpha, beta, gamma) {
+    const r = Math.PI / 180, a = (alpha || 0) * r, b = beta * r, g = gamma * r;
+    const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+    const Rz = [ca, -sa, 0, sa, ca, 0, 0, 0, 1], Rx = [1, 0, 0, 0, cb, -sb, 0, sb, cb], Ry = [cg, 0, sg, 0, 1, 0, -sg, 0, cg];
+    return mm(mm(Rz, Rx), Ry);
+  }
+  // device axes -> back-camera OpenCV axes, for the current screen rotation (same convention as upFromOrientation)
+  function camFromDevice(screenAngle) {
+    const a = -(screenAngle || 0) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+    return mm([1, 0, 0, 0, -1, 0, 0, 0, -1], [c, -s, 0, s, c, 0, 0, 0, 1]);
+  }
+  // how the camera turned between two phone orientations, in camera axes: x_now = D * x_then
+  function turnBetween(Qnow, Qthen, screenAngle) { const M = camFromDevice(screenAngle); return mm(mm(M, mm(tr3(Qnow), Qthen)), tr3(M)); }
+  function rotAngle(R) { return Math.acos(Math.max(-1, Math.min(1, (R[0] + R[4] + R[8] - 1) / 2))); }
+  function solFrom(R, C, base) {
+    const t = mv(R, C).map(v => -v);
+    return Object.assign({}, base, { R, C: C.slice(), t, p: [...logmap(R), ...t] });
+  }
+  // Keeps one steady pose. measure() takes each new detection (with the phone orientation at the moment the frame was
+  // captured); current() returns the pose to draw now, turned by the gyroscope since then.
+  // Small differences between detections are treated as noise and smoothed; big ones are taken at once.
+  function makeStabilizer(o = {}) {
+    const cfg = Object.assign({ rotNoiseDeg: 0.6, rotSnapDeg: 5, posNoise: 0.03, posSnap: 0.2, minA: 0.12 }, o);
+    let st = null;
+    const alpha = (x, noise, snap) => Math.min(1, cfg.minA + Math.max(0, (x - noise) / (snap - noise)) ** 2 * (1 - cfg.minA));
+    return {
+      reset() { st = null; },
+      get ready() { return !!st; },
+      measure(sol, Qsnap, screenAngle) {
+        if (!st) { st = { R: sol.R.slice(), C: sol.C.slice(), Q: Qsnap, ang: screenAngle, base: sol }; return; }
+        const Rpred = st.Q && Qsnap ? mm(turnBetween(Qsnap, st.Q, screenAngle), st.R) : st.R;   // where the old pose is now
+        const E = mm(sol.R, tr3(Rpred)), th = rotAngle(E) * 180 / Math.PI;
+        const aR = alpha(th, cfg.rotNoiseDeg, cfg.rotSnapDeg);
+        const w = logmap(E).map(v => v * aR);                      // turn part of the way toward the new detection
+        const R = mm(rodrigues(w), Rpred);
+        const dist = Math.max(0.3, Math.hypot(st.C[0], st.C[2])), dC = sol.C.map((v, i) => v - st.C[i]);
+        const aC = alpha(Math.hypot(...dC) / dist, cfg.posNoise, cfg.posSnap);
+        st = { R, C: st.C.map((v, i) => v + aC * dC[i]), Q: Qsnap, ang: screenAngle, base: sol };
+      },
+      current(Qnow, screenAngle) {
+        if (!st) return null;
+        const R = st.Q && Qnow ? mm(turnBetween(Qnow, st.Q, screenAngle), st.R) : st.R;
+        return solFrom(R, st.C, st.base);
+      },
+    };
+  }
+
+  // Recent phone orientations, so we can ask "how was the phone turned at time t" (the camera picture lags the sensor).
+  function makeOrientationHistory(keepMs = 2500) {
+    const h = [];
+    return {
+      push(t, Q) {
+        if (h.length) { const last = h[h.length - 1]; if (rotAngle(mm(tr3(last.Q), Q)) > 0.6) { h.length = 0; } }   // >34° in one step: sensor glitch / re-zero
+        h.push({ t, Q }); while (h.length && h[0].t < t - keepMs) h.shift();
+      },
+      get size() { return h.length; },
+      at(t) {
+        if (!h.length) return null;
+        if (t <= h[0].t) return h[0].Q; if (t >= h[h.length - 1].t) return h[h.length - 1].Q;
+        let lo = 0, hi = h.length - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (h[m].t <= t) lo = m; else hi = m; }
+        const a = h[lo], b = h[hi], f = (t - a.t) / Math.max(1e-6, b.t - a.t);
+        return mm(a.Q, rodrigues(logmap(mm(tr3(a.Q), b.Q)).map(v => v * f)));
+      },
+    };
+  }
+  // How far the picture moved between two small grey frames (content displacement, pixels). Block matching + sub-pixel.
+  function imageShift(a, b, w, h, s = 6) {
+    let best = Infinity, bx = 0, by = 0; const sad = new Float64Array((2 * s + 1) ** 2); let sum = 0;
+    for (let dy = -s; dy <= s; dy++) for (let dx = -s; dx <= s; dx++) {
+      let e = 0, n = 0;
+      for (let y = s + 1; y < h - s - 1; y += 2) for (let x = s + 1; x < w - s - 1; x += 2) { e += Math.abs(b[(y + dy) * w + x + dx] - a[y * w + x]); n++; }
+      e /= n; sad[(dy + s) * (2 * s + 1) + dx + s] = e; sum += e; if (e < best) { best = e; bx = dx; by = dy; }
+    }
+    const at = (dx, dy) => sad[(dy + s) * (2 * s + 1) + dx + s];
+    const sub = (m, c, p) => { const d = m - 2 * c + p; return d > 1e-9 ? 0.5 * (m - p) / d : 0; };
+    const fx = Math.abs(bx) < s ? sub(at(bx - 1, by), best, at(bx + 1, by)) : 0, fy = Math.abs(by) < s ? sub(at(bx, by - 1), best, at(bx, by + 1)) : 0;
+    const mean = sum / sad.length;
+    return { dx: bx + fx, dy: by + fy, edge: Math.abs(bx) === s || Math.abs(by) === s, quality: mean > 0 ? 1 - best / mean : 0 };
+  }
+  // Finds the delay between the motion sensor and the camera picture by lining up picture motion with gyro motion.
+  function makeDelayCalibrator() {
+    const obs = []; let lag = null, info = {};
+    return {
+      get info() { return info; },
+      add(ta, tb, sh) { if (sh.edge || sh.quality < 0.25) return; obs.push({ ta, tb, m: [sh.dx, sh.dy] }); while (obs.length && obs[0].tb < tb - 4000) obs.shift(); },
+      get lag() { return lag; },
+      estimate(hist, screenAngle, fSmall) {
+        info = { n: obs.length };
+        if (obs.length < 20) return lag;
+        const energy = obs.reduce((s, o) => s + o.m[0] ** 2 + o.m[1] ** 2, 0) / obs.length;
+        info.energy = +energy.toFixed(3);
+        if (energy < 0.15) return lag;                                  // phone too still to tell
+        let bestL = null, bestR = Infinity;
+        for (let L = 0; L <= 250; L += 5) {
+          const P = obs.map(o => { const D = turnBetween(hist.at(o.tb - L), hist.at(o.ta - L), screenAngle); return [D[2] / D[8], D[5] / D[8]]; });
+          let mp = 0, pp = 0; obs.forEach((o, i) => { mp += o.m[0] * P[i][0] + o.m[1] * P[i][1]; pp += P[i][0] ** 2 + P[i][1] ** 2; });
+          const sc = pp > 0 ? mp / pp : 0;                              // fitted focal length (so a wrong FOV setting doesn't matter)
+          if (sc < fSmall * 0.5 || sc > fSmall * 2) continue;
+          const r = obs.reduce((s, o, i) => s + (o.m[0] - sc * P[i][0]) ** 2 + (o.m[1] - sc * P[i][1]) ** 2, 0) / obs.length;
+          if (r < bestR) { bestR = r; bestL = L; }
+        }
+        Object.assign(info, { bestL, ratio: bestL === null ? null : +(bestR / energy).toFixed(3) });
+        if (bestL === null || bestR > 0.5 * energy) return lag;
+        lag = lag === null ? bestL : 0.7 * lag + 0.3 * bestL;
+        return lag;
+      },
+    };
+  }
+
+  const api = { solve, plausible, GATE, makeStabilizer, makeOrientationHistory, imageShift, makeDelayCalibrator, deviceQ, camFromDevice, turnBetween, wireframe, threePose, upFromOrientation, project, rodrigues, lookAt, logmap, labelCorners, CORNERS, H_DEFAULT };
   if (typeof module !== 'undefined') module.exports = api; else root.PyramidSolver = api;
 })(typeof self !== 'undefined' ? self : this);
