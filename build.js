@@ -11,6 +11,7 @@
     // ---------- stones ----------
     const stoneMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.92, metalness: 0, vertexColors: false });
     const goldMat = new THREE.MeshStandardMaterial({ color: 0xffcf5a, emissive: 0x7a4b00, emissiveIntensity: 0.8, metalness: 0.85, roughness: 0.25 });
+    const SHOW_VEIL = false;   // pale cover over the unbuilt part of the real pyramid: turned off
     const veilMat = new THREE.MeshBasicMaterial({ color: 0xaebfcf, transparent: true, opacity: 0.42, depthWrite: false, side: THREE.DoubleSide });
     const veilPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);   // the veil covers only the part not built yet
     veilMat.clippingPlanes = [veilPlane];
@@ -148,7 +149,7 @@
         B.glow.intensity = tc > CAP_S ? 3 * Math.exp(-(tc - CAP_S) * 1.5) : 0;
         // the veil hides the real pyramid above the courses laid so far, so it looks as if it isn't there yet
         const builtTo = Math.min(H, B.list.reduce((m, b) => (t - b.start > FLY ? Math.max(m, b.y + B.hc / 2) : m), 0));
-        veilPlane.constant = -(pc >= 1 ? H * 2 : builtTo); B.veil.visible = pc < 1;
+        veilPlane.constant = -(pc >= 1 ? H * 2 : builtTo); B.veil.visible = SHOW_VEIL && pc < 1;
         // fireworks from behind, after the capstone
         const tf = t - BUILD_S - 0.3 - CAP_S - FIRE_START;
         if (tf >= 0) { if (!fw) fw = fireworksPlan(camC); drawFireworks(tf); points.visible = tf < FIRE_S + 2.5; } else { points.visible = false; fw = null; }
